@@ -32,4 +32,4 @@ cargo run --release
 
 ## License
 
-MIT License - See LICENSE file for details.
+APACHE 2.0
