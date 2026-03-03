@@ -1,8 +1,6 @@
-# FROST
+# FROST (Fridge Remote Operations, Status, and Thermometry)
 
-**Fridge Remote Operations, Software, and Thermometry**
-
-Cryostat control for MEC' Prime 
+Primary cryostat control software for MEC' (MKID Exoplanet Camera) Prime
 
 ## Overview
 
@@ -31,7 +29,6 @@ cargo run --release
 
 ## Status
 
-🚧 **Early Development** - Basic GUI framework implemented, hardware integrations coming soon.
 
 ## License
 
