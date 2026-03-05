@@ -5,6 +5,7 @@
 //   frost heatswitch [--port /dev/ttyUSB4] <command>
 //   frost lakeshore625 [--port /dev/ttyUSB0] <command>
 //   frost lakeshore370 [--port /dev/ttyUSB1] <command>
+//   frost lakeshore350 [--port /dev/ttyUSB2] <command>
 //
 // Run `frost --help` or `frost <device> --help` for full option lists.
 
@@ -14,6 +15,7 @@ use crate::compressor::CryomechController;
 use crate::heatswitch::{HeatswitchController, HEATSWITCH_TRAVEL_STEPS};
 use crate::lakeshore625::LakeShore625Controller;
 use crate::lakeshore370::LakeShore370Controller;
+use crate::lakeshore350::LakeShore350Controller;
 
 // ── Top-level CLI ─────────────────────────────────────────────
 #[derive(Parser)]
@@ -71,6 +73,16 @@ enum Device {
         baud: u32,
         #[command(subcommand)]
         command: Lakeshore370Cmd,
+    },
+
+    /// Lake Shore 350 temperature controller
+    Lakeshore350 {
+        #[arg(long, default_value = "/dev/ttyUSB2", help = "Serial port")]
+        port: String,
+        #[arg(long, default_value = "57600", help = "Baud rate")]
+        baud: u32,
+        #[command(subcommand)]
+        command: Lakeshore350Cmd,
     },
 }
 
@@ -262,6 +274,35 @@ enum Lakeshore370Cmd {
     },
 }
 
+// ── LakeShore 350 subcommands ────────────────────────────────
+#[derive(Subcommand)]
+enum Lakeshore350Cmd {
+    /// Get device identification (*IDN?)
+    Identify,
+    /// Read raw sensor value for one input: A, B, C, D1–D5 (SRDG?)
+    Sensor { input: String },
+    /// Read temperature in Kelvin for one input: A, B, C, D1–D5 (KRDG?)
+    Kelvin { input: String },
+    /// Read B (ADR) and D2 (4K stage): sensor + Kelvin for each
+    All,
+    /// Get front panel display name for one input (INNAME?)
+    /// Valid inputs: A, B, C, D1, D2, D3, D4, D5
+    DisplayShow { input: String },
+    /// Get front panel display names for all inputs (INNAME? A … D5)
+    DisplayShowAll,
+    /// Set front panel display name for one input (INNAME)
+    /// Valid inputs: A, B, C, D1, D2, D3, D4, D5
+    DisplaySetName {
+        input: String,
+        name: String,
+    },
+    /// Send a raw command string and print the response
+    Raw {
+        #[arg(required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+}
+
 // ── Entry point ───────────────────────────────────────────────
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
@@ -294,6 +335,12 @@ pub fn run() -> Result<(), String> {
             ctrl.port = port;
             ctrl.baud_rate = baud;
             run_lakeshore370(&mut ctrl, command)
+        }
+        Device::Lakeshore350 { port, baud, command } => {
+            let mut ctrl = LakeShore350Controller::default();
+            ctrl.port = port;
+            ctrl.baud_rate = baud;
+            run_lakeshore350(&mut ctrl, command)
         }
     }
 }
@@ -628,6 +675,46 @@ fn run_lakeshore370(ctrl: &mut LakeShore370Controller, cmd: Lakeshore370Cmd) -> 
             Ok(())
         }
         Lakeshore370Cmd::Raw { command } => {
+            let cmd_str = command.join(" ");
+            ctrl.raw_command(&cmd_str);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+    }
+}
+
+// ── LakeShore 350 dispatch ────────────────────────────────────
+fn run_lakeshore350(ctrl: &mut LakeShore350Controller, cmd: Lakeshore350Cmd) -> Result<(), String> {
+    match cmd {
+        Lakeshore350Cmd::Identify => {
+            ctrl.get_identification();
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::Sensor { input } => {
+            ctrl.get_sensor(&input);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::Kelvin { input } => {
+            ctrl.get_kelvin(&input);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::All => {
+            ctrl.get_all_readings();
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::DisplayShow { input } => {
+            ctrl.get_display_name(&input);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::DisplayShowAll => {
+            ctrl.get_all_display_names();
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::DisplaySetName { input, name } => {
+            ctrl.set_display_name(&input, &name)?;
+            println!("Display name for input {} set to '{}'.", input, name);
+            Ok(())
+        }
+        Lakeshore350Cmd::Raw { command } => {
             let cmd_str = command.join(" ");
             ctrl.raw_command(&cmd_str);
             print_ctrl(&ctrl.output, &ctrl.error_message)

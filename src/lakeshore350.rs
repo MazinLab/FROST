@@ -10,11 +10,11 @@
 //
 // Hardware channel map:
 //   Input A  — 3-head resistance thermometer (requires calibration in software)
-//   Input B  — (empty / spare)
+//   Input B  — ADR thermometer (resistance → Kelvin via KRDG?)
 //   Input C  — 4-head resistance thermometer (requires calibration in software)
 //   Input D1 — (empty / spare)
-//   Input D2 — 4-switch (voltage → temperature via pumps_calibration)
-//   Input D3 — 4K stage diode (calibrated directly on Lakeshore, curve 21)
+//   Input D2 — 4K stage diode (calibrated on Lakeshore, KRDG? returns Kelvin)
+//   Input D3 — (spare)
 //   Input D4 — 3-pump diode (voltage → temperature via pumps_calibration)
 //   Input D5 — 4-pump diode (voltage → temperature via pumps_calibration)
 //   Channels 1–8 — mirrors of Input A (not used by FROST)
@@ -209,6 +209,151 @@ impl LakeShore350Controller {
         Ok(())
     }
 
+    // ── Temperature / sensor readings ─────────────────────────
+
+    /// `SRDG? <input>` — raw sensor reading.
+    /// Returns the numeric string (Ω for resistive inputs, V for diodes),
+    /// "R_OVER" on overrange, or "NO_RESPONSE" if the device is silent.
+    /// Mirrors Python `read_sensor()` in temperature.py.
+    fn read_sensor_raw(&self, input: &str) -> Result<String, String> {
+        let r = self.send_command(&format!("SRDG? {input}"))?;
+        if r.is_empty() {
+            return Ok("NO_RESPONSE".to_string());
+        }
+        // Overrange indicators (mirrors Python length / garbage-char check)
+        if r.len() > 15 || r.contains('`') || r.contains('\x00') {
+            return Ok("R_OVER".to_string());
+        }
+        let up = r.to_uppercase();
+        if up.contains("OVER") || up.contains("R.") || up.contains("R_") {
+            return Ok("R_OVER".to_string());
+        }
+        Ok(r)
+    }
+
+    /// `RDGST? <input>` + `KRDG? <input>` — temperature in Kelvin.
+    /// Returns the numeric K string, "T_OVER", "NO_RESPONSE", or an `Err`.
+    /// Mirrors Python `read_temperature()` in temperature.py.
+    fn read_kelvin_raw(&self, input: &str) -> Result<String, String> {
+        // Check overrange status first (bit 32 set → T_OVER)
+        if let Ok(status) = self.send_command(&format!("RDGST? {input}")) {
+            if let Ok(code) = status.trim().parse::<u32>() {
+                if code & 32 != 0 {
+                    return Ok("T_OVER".to_string());
+                }
+            }
+        }
+        let r = self.send_command(&format!("KRDG? {input}"))?;
+        if r.is_empty() {
+            return Ok("NO_RESPONSE".to_string());
+        }
+        if r.len() > 15 || r.contains('`') || r.contains('\x00') {
+            return Ok("T_OVER".to_string());
+        }
+        let up = r.to_uppercase();
+        if up.contains("OVER") || up.contains("T.") || up.contains("T_") {
+            return Ok("T_OVER".to_string());
+        }
+        // Zero on D-type inputs indicates overrange (mirrors Python)
+        let inp_up = input.to_uppercase();
+        if let Ok(v) = r.parse::<f64>() {
+            if v == 0.0 && matches!(inp_up.as_str(), "D2" | "D3" | "D4" | "D5") {
+                return Ok("T_OVER".to_string());
+            }
+        }
+        Ok(r)
+    }
+
+    /// `SRDG? <input>` — get raw sensor reading into `self.output`.
+    pub fn get_sensor(&mut self, input: &str) {
+        let input = input.to_uppercase();
+        if !ALL_INPUTS.contains(&input.as_str()) {
+            self.error_message = Some(format!(
+                "Invalid input '{}'. Must be one of: {}",
+                input, ALL_INPUTS.join(", ")
+            ));
+            return;
+        }
+        match self.read_sensor_raw(&input) {
+            Ok(r) => {
+                let unit = sensor_unit(&input);
+                self.output = if let Ok(v) = r.parse::<f64>() {
+                    format!("Input {input}: {v:.4} {unit}\n")
+                } else {
+                    format!("Input {input}: {r}\n")
+                };
+                self.error_message = None;
+            }
+            Err(e) => self.error_message = Some(e),
+        }
+    }
+
+    /// `KRDG? <input>` (with `RDGST?` check) — get temperature in Kelvin into `self.output`.
+    pub fn get_kelvin(&mut self, input: &str) {
+        let input = input.to_uppercase();
+        if !ALL_INPUTS.contains(&input.as_str()) {
+            self.error_message = Some(format!(
+                "Invalid input '{}'. Must be one of: {}",
+                input, ALL_INPUTS.join(", ")
+            ));
+            return;
+        }
+        match self.read_kelvin_raw(&input) {
+            Ok(r) => {
+                self.output = if let Ok(v) = r.parse::<f64>() {
+                    format!("Input {input}: {v:.4} K\n")
+                } else {
+                    format!("Input {input}: {r}\n")
+                };
+                self.error_message = None;
+            }
+            Err(e) => self.error_message = Some(e),
+        }
+    }
+
+    /// Read B (ADR) and D2 (4K stage) and print sensor + Kelvin for each.
+    /// Mirrors the core of `lakeshore350 --all` for these two inputs.
+    pub fn get_all_readings(&mut self) {
+        let mut out = String::new();
+
+        // ── Input B (ADR) ─────────────────────────────────────
+        let b_raw = self.read_sensor_raw("B")
+            .unwrap_or_else(|e| format!("ERROR ({e})"));
+        let b_kelvin = self.read_kelvin_raw("B")
+            .unwrap_or_else(|e| format!("ERROR ({e})"));
+        let b_raw_str = if let Ok(v) = b_raw.parse::<f64>() {
+            format!("{v:.4} Ω")
+        } else {
+            b_raw
+        };
+        let b_k_str = if let Ok(v) = b_kelvin.parse::<f64>() {
+            format!("{v:.4} K")
+        } else {
+            b_kelvin
+        };
+        out.push_str(&format!("Input B  (ADR):      {b_raw_str} → {b_k_str}\n"));
+
+        // ── Input D2 (4K stage) ───────────────────────────────
+        let d2_raw = self.read_sensor_raw("D2")
+            .unwrap_or_else(|e| format!("ERROR ({e})"));
+        let d2_kelvin = self.read_kelvin_raw("D2")
+            .unwrap_or_else(|e| format!("ERROR ({e})"));
+        let d2_raw_str = if let Ok(v) = d2_raw.parse::<f64>() {
+            format!("{v:.4} V")
+        } else {
+            d2_raw
+        };
+        let d2_k_str = if let Ok(v) = d2_kelvin.parse::<f64>() {
+            format!("{v:.4} K")
+        } else {
+            d2_kelvin
+        };
+        out.push_str(&format!("Input D2 (4K stage): {d2_raw_str} → {d2_k_str}\n"));
+
+        self.output = out;
+        self.error_message = None;
+    }
+
     // ── Raw command ───────────────────────────────────────────
 
     /// Send an arbitrary command string and put the response in `output`.
@@ -224,5 +369,17 @@ impl LakeShore350Controller {
             }
             Err(e) => self.error_message = Some(e),
         }
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+
+/// Returns the expected SI unit for `SRDG?` on a given input.
+/// A, B, C, D1 are resistance thermometers → Ω.
+/// D2–D5 are diodes / voltage sensors → V.
+fn sensor_unit(input: &str) -> &'static str {
+    match input.to_uppercase().as_str() {
+        "A" | "B" | "C" | "D1" => "Ω",
+        _ => "V",
     }
 }

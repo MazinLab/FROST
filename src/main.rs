@@ -2,6 +2,7 @@ mod compressor;
 mod heatswitch;
 mod lakeshore625;
 mod lakeshore370;
+mod lakeshore350;
 mod gui;
 mod cli;
 
