@@ -13,8 +13,8 @@
 //   Input B  — ADR thermometer (resistance → Kelvin via KRDG?)
 //   Input C  — 4-head resistance thermometer (requires calibration in software)
 //   Input D1 — (empty / spare)
-//   Input D2 — 4K stage diode (calibrated on Lakeshore, KRDG? returns Kelvin)
-//   Input D3 — (spare)
+//   Input D2 — Switch voltage reading (voltage only, no temperature calibration)
+//   Input D3 — 4K stage diode (calibrated on Lakeshore, KRDG? returns Kelvin)
 //   Input D4 — 3-pump diode (voltage → temperature via pumps_calibration)
 //   Input D5 — 4-pump diode (voltage → temperature via pumps_calibration)
 //   Channels 1–8 — mirrors of Input A (not used by FROST)
@@ -22,6 +22,7 @@
 use serialport::{DataBits, Parity, StopBits};
 use std::io::{Read, Write};
 use std::time::Duration;
+use std::path::Path;
 
 // ── Default connection settings ───────────────────────────────
 const DEFAULT_PORT: &str = "/dev/ttyUSB2";
@@ -29,6 +30,249 @@ const DEFAULT_BAUD: u32 = 57600;
 
 /// All valid input / channel identifiers on the Lakeshore 350.
 pub const ALL_INPUTS: [&str; 8] = ["A", "B", "C", "D1", "D2", "D3", "D4", "D5"];
+/// All valid output identifiers on the Lakeshore 350.
+pub const ALL_OUTPUTS: [u8; 4] = [1, 2, 3, 4];
+
+// ── 3-head calibration ────────────────────────────────────────
+/// 3-head resistance thermometer calibration.
+/// Mirrors ThreeHeadCalibration class in head3_calibration.py.
+pub struct ThreeHeadCalibration {
+    resistances: Vec<f64>,
+    temperatures: Vec<f64>,
+}
+
+impl ThreeHeadCalibration {
+    /// Load calibration from CSV file (Temperature K, Resistance Ω).
+    pub fn from_csv<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let mut resistances = Vec::new();
+        let mut temperatures = Vec::new();
+        
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("Failed to open calibration file {:?}: {}", path.as_ref(), e))?;
+        
+        let mut reader = csv::Reader::from_reader(file);
+        
+        // Skip header and parse data
+        for (i, result) in reader.records().enumerate() {
+            let record = result.map_err(|e| format!("CSV parse error at line {}: {}", i + 2, e))?;
+            
+            if record.len() < 2 {
+                continue; // Skip incomplete rows
+            }
+            
+            if let (Ok(temp), Ok(resistance)) = (record[0].parse::<f64>(), record[1].parse::<f64>()) {
+                if temp > 0.0 && resistance > 0.0 {
+                    temperatures.push(temp);
+                    resistances.push(resistance);
+                }
+            }
+        }
+        
+        if resistances.is_empty() {
+            return Err("No valid calibration data found in CSV".to_string());
+        }
+        
+        Ok(Self { resistances, temperatures })
+    }
+    
+    /// Convert resistance (Ω) to temperature (K) using linear interpolation.
+    /// Mirrors resistance_to_temperature() method in Python.
+    pub fn resistance_to_temperature(&self, resistance: f64) -> Option<f64> {
+        if resistance <= 0.0 || self.resistances.is_empty() {
+            return None;
+        }
+        
+        // Find the interpolation range
+        if resistance <= self.resistances[0] {
+            return Some(self.temperatures[0]); // Below range, return first temp
+        }
+        if resistance >= self.resistances[self.resistances.len() - 1] {
+            return Some(self.temperatures[self.temperatures.len() - 1]); // Above range, return last temp
+        }
+        
+        // Linear interpolation between two points
+        for i in 0..self.resistances.len() - 1 {
+            if resistance >= self.resistances[i] && resistance <= self.resistances[i + 1] {
+                let r1 = self.resistances[i];
+                let r2 = self.resistances[i + 1];
+                let t1 = self.temperatures[i];
+                let t2 = self.temperatures[i + 1];
+                
+                // Linear interpolation: t = t1 + (t2 - t1) * (r - r1) / (r2 - r1)
+                let temp = t1 + (t2 - t1) * (resistance - r1) / (r2 - r1);
+                return Some(temp);
+            }
+        }
+        
+        None
+    }
+}
+
+/// 4-head resistance thermometer calibration.
+/// Mirrors FourHeadCalibration class in head4_calibration.py.
+pub struct FourHeadCalibration {
+    resistances: Vec<f64>,
+    temperatures: Vec<f64>,
+}
+
+impl FourHeadCalibration {
+    /// Load calibration from CSV file (Temperature K, Resistance Ω) and sort by resistance.
+    pub fn from_csv<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let mut resistances = Vec::new();
+        let mut temperatures = Vec::new();
+        
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("Failed to open calibration file {:?}: {}", path.as_ref(), e))?;
+        
+        let mut reader = csv::Reader::from_reader(file);
+        
+        // Skip header and parse data
+        for (i, result) in reader.records().enumerate() {
+            let record = result.map_err(|e| format!("CSV parse error at line {}: {}", i + 2, e))?;
+            
+            if record.len() < 2 {
+                continue; // Skip incomplete rows
+            }
+            
+            if let (Ok(temp), Ok(resistance)) = (record[0].parse::<f64>(), record[1].parse::<f64>()) {
+                if temp > 0.0 && resistance > 0.0 {
+                    temperatures.push(temp);
+                    resistances.push(resistance);
+                }
+            }
+        }
+        
+        if resistances.is_empty() {
+            return Err("No valid calibration data found in CSV".to_string());
+        }
+        
+        // Sort by resistance (increasing order) as done in Python
+        let mut pairs: Vec<(f64, f64)> = resistances.iter().zip(temperatures.iter()).map(|(&r, &t)| (r, t)).collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        
+        let (sorted_resistances, sorted_temperatures): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
+        
+        Ok(Self {
+            resistances: sorted_resistances,
+            temperatures: sorted_temperatures,
+        })
+    }
+    
+    /// Convert resistance (Ω) to temperature (K) using linear interpolation.
+    /// Mirrors resistance_to_temperature() method in Python.
+    pub fn resistance_to_temperature(&self, resistance: f64) -> Option<f64> {
+        if resistance <= 0.0 || self.resistances.is_empty() {
+            return None;
+        }
+        
+        // Find the interpolation range
+        if resistance <= self.resistances[0] {
+            return Some(self.temperatures[0]); // Below range, return first temp
+        }
+        if resistance >= self.resistances[self.resistances.len() - 1] {
+            return Some(self.temperatures[self.temperatures.len() - 1]); // Above range, return last temp
+        }
+        
+        // Linear interpolation between two points
+        for i in 0..self.resistances.len() - 1 {
+            if resistance >= self.resistances[i] && resistance <= self.resistances[i + 1] {
+                let r1 = self.resistances[i];
+                let r2 = self.resistances[i + 1];
+                let t1 = self.temperatures[i];
+                let t2 = self.temperatures[i + 1];
+                
+                // Linear interpolation: t = t1 + (t2 - t1) * (r - r1) / (r2 - r1)
+                let temp = t1 + (t2 - t1) * (resistance - r1) / (r2 - r1);
+                return Some(temp);
+            }
+        }
+        
+        None
+    }
+}
+
+/// Pump voltage-to-temperature calibration for 3-pump and 4-pump diodes.
+/// Mirrors PumpCalibration class in pump_calibration.py.
+pub struct PumpCalibration {
+    voltages: Vec<f64>,
+    temperatures: Vec<f64>,
+}
+
+impl PumpCalibration {
+    /// Load calibration from CSV file (Temperature K, Voltage V) and sort by voltage.
+    pub fn from_csv<P: AsRef<Path>>(path: P) -> Result<Self, String> {
+        let mut voltages = Vec::new();
+        let mut temperatures = Vec::new();
+        
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("Failed to open pump calibration file {:?}: {}", path.as_ref(), e))?;
+        
+        let mut reader = csv::Reader::from_reader(file);
+        
+        // Skip header and parse data
+        for (i, result) in reader.records().enumerate() {
+            let record = result.map_err(|e| format!("CSV parse error at line {}: {}", i + 2, e))?;
+            
+            if record.len() < 2 {
+                continue; // Skip incomplete rows
+            }
+            
+            if let (Ok(temp), Ok(voltage)) = (record[0].parse::<f64>(), record[1].parse::<f64>()) {
+                if temp > 0.0 && voltage > 0.0 {
+                    temperatures.push(temp);
+                    voltages.push(voltage);
+                }
+            }
+        }
+        
+        if voltages.is_empty() {
+            return Err("No valid pump calibration data found in CSV".to_string());
+        }
+        
+        // Sort by voltage (increasing order) as done in Python for interpolation
+        let mut pairs: Vec<(f64, f64)> = voltages.iter().zip(temperatures.iter()).map(|(&v, &t)| (v, t)).collect();
+        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        
+        let (sorted_voltages, sorted_temperatures): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
+        
+        Ok(Self {
+            voltages: sorted_voltages,
+            temperatures: sorted_temperatures,
+        })
+    }
+    
+    /// Convert voltage (V) to temperature (K) using linear interpolation.
+    /// Mirrors convert_voltage_to_temperature() method in Python.
+    pub fn voltage_to_temperature(&self, voltage: f64) -> Option<f64> {
+        if voltage <= 0.0 || self.voltages.is_empty() {
+            return None;
+        }
+        
+        // Find the interpolation range
+        if voltage <= self.voltages[0] {
+            return Some(self.temperatures[0]); // Below range, return first temp
+        }
+        if voltage >= self.voltages[self.voltages.len() - 1] {
+            return Some(self.temperatures[self.temperatures.len() - 1]); // Above range, return last temp
+        }
+        
+        // Linear interpolation between two points
+        for i in 0..self.voltages.len() - 1 {
+            if voltage >= self.voltages[i] && voltage <= self.voltages[i + 1] {
+                let v1 = self.voltages[i];
+                let v2 = self.voltages[i + 1];
+                let t1 = self.temperatures[i];
+                let t2 = self.temperatures[i + 1];
+                
+                // Linear interpolation: t = t1 + (t2 - t1) * (v - v1) / (v2 - v1)
+                let temp = t1 + (t2 - t1) * (voltage - v1) / (v2 - v1);
+                return Some(temp);
+            }
+        }
+        
+        None
+    }
+}
 
 // ── Controller state ──────────────────────────────────────────
 pub struct LakeShore350Controller {
@@ -43,6 +287,15 @@ pub struct LakeShore350Controller {
     // ── GUI input fields (populated as tabs are added) ────────
     /// Selected input channel label (e.g. "A", "D3").
     pub selected_input: String,
+    
+    /// 3-head temperature calibration (loaded lazily).
+    three_head_cal: Option<ThreeHeadCalibration>,
+    
+    /// 4-head temperature calibration (loaded lazily).
+    four_head_cal: Option<FourHeadCalibration>,
+    
+    /// Pump temperature calibration for D4/D5 (loaded lazily).
+    pump_cal: Option<PumpCalibration>,
 }
 
 impl Default for LakeShore350Controller {
@@ -53,6 +306,9 @@ impl Default for LakeShore350Controller {
             error_message: None,
             output: String::new(),
             selected_input: "A".to_string(),
+            three_head_cal: None,
+            four_head_cal: None,
+            pump_cal: None,
         }
     }
 }
@@ -121,6 +377,15 @@ impl LakeShore350Controller {
         std::thread::sleep(Duration::from_millis(200));
 
         Ok(())
+    }
+
+    /// Validate output number (1–4).
+    fn validate_output(output_num: u8) -> Result<(), String> {
+        if ALL_OUTPUTS.contains(&output_num) {
+            Ok(())
+        } else {
+            Err("Output number must be 1, 2, 3, or 4.".to_string())
+        }
     }
 
     // ── Identity / info ───────────────────────────────────────
@@ -257,7 +522,7 @@ impl LakeShore350Controller {
         // Zero on D-type inputs indicates overrange (mirrors Python)
         let inp_up = input.to_uppercase();
         if let Ok(v) = r.parse::<f64>() {
-            if v == 0.0 && matches!(inp_up.as_str(), "D2" | "D3" | "D4" | "D5") {
+            if v == 0.0 && matches!(inp_up.as_str(), "D3" | "D4" | "D5") {
                 return Ok("T_OVER".to_string());
             }
         }
@@ -311,10 +576,13 @@ impl LakeShore350Controller {
         }
     }
 
-    /// Read B (ADR) and D2 (4K stage) and print sensor + Kelvin for each.
-    /// Mirrors the core of `lakeshore350 --all` for these two inputs.
+    /// Read A (3-head), B (ADR), C (4-head), D3 (4K stage), D4 (3-pump), and D5 (4-pump) and print sensor + Kelvin/calibrated for each.
+    /// Mirrors the core of `lakeshore350 --all` for these six key inputs.
     pub fn get_all_readings(&mut self) {
         let mut out = String::new();
+
+        // ── Input A (3-head) ──────────────────────────────────
+        out.push_str(&format!("{}\n", self.get_3head_temperature_internal()));
 
         // ── Input B (ADR) ─────────────────────────────────────
         let b_raw = self.read_sensor_raw("B")
@@ -333,25 +601,333 @@ impl LakeShore350Controller {
         };
         out.push_str(&format!("Input B  (ADR):      {b_raw_str} → {b_k_str}\n"));
 
-        // ── Input D2 (4K stage) ───────────────────────────────
-        let d2_raw = self.read_sensor_raw("D2")
+        // ── Input C (4-head) ──────────────────────────────────
+        out.push_str(&format!("{}\n", self.get_4head_temperature_internal()));
+
+        // ── Input D3 (4K stage) ───────────────────────────────
+        let d3_raw = self.read_sensor_raw("D3")
             .unwrap_or_else(|e| format!("ERROR ({e})"));
-        let d2_kelvin = self.read_kelvin_raw("D2")
+        let d3_kelvin = self.read_kelvin_raw("D3")
             .unwrap_or_else(|e| format!("ERROR ({e})"));
-        let d2_raw_str = if let Ok(v) = d2_raw.parse::<f64>() {
+        let d3_raw_str = if let Ok(v) = d3_raw.parse::<f64>() {
             format!("{v:.4} V")
         } else {
-            d2_raw
+            d3_raw
         };
-        let d2_k_str = if let Ok(v) = d2_kelvin.parse::<f64>() {
+        let d3_k_str = if let Ok(v) = d3_kelvin.parse::<f64>() {
             format!("{v:.4} K")
         } else {
-            d2_kelvin
+            d3_kelvin
         };
-        out.push_str(&format!("Input D2 (4K stage): {d2_raw_str} → {d2_k_str}\n"));
+        out.push_str(&format!("Input D3 (4K stage): {d3_raw_str} → {d3_k_str}\n"));
+
+        // ── Input D4 (3-pump) ─────────────────────────────────
+        out.push_str(&format!("{}\n", self.get_3pump_temperature_internal()));
+
+        // ── Input D5 (4-pump) ─────────────────────────────────
+        out.push_str(&format!("{}\n", self.get_4pump_temperature_internal()));
 
         self.output = out;
         self.error_message = None;
+    }
+
+    // ── 3-head calibrated temperature ─────────────────────────
+
+    /// Load 3-head calibration from CSV file if not already loaded.
+    fn ensure_3head_calibration(&mut self) -> Result<(), String> {
+        if self.three_head_cal.is_none() {
+            // Try standard paths
+            let paths = [
+                "src/gl7_calibrations/3_head_cal.csv",
+                "gl7_calibrations/3_head_cal.csv",
+                "../gl7_calibrations/3_head_cal.csv",
+            ];
+            
+            for path in &paths {
+                if Path::new(path).exists() {
+                    match ThreeHeadCalibration::from_csv(path) {
+                        Ok(cal) => {
+                            self.three_head_cal = Some(cal);
+                            return Ok(());
+                        }
+                        Err(e) => return Err(format!("Failed to load calibration from {}: {}", path, e)),
+                    }
+                }
+            }
+            
+            return Err("3-head calibration file not found in expected locations".to_string());
+        }
+        Ok(())
+    }
+
+    /// Load 4-head calibration from CSV file if not already loaded.
+    fn ensure_4head_calibration(&mut self) -> Result<(), String> {
+        if self.four_head_cal.is_none() {
+            // Try standard paths
+            let paths = [
+                "src/gl7_calibrations/4_head_cal.csv",
+                "gl7_calibrations/4_head_cal.csv",
+                "../gl7_calibrations/4_head_cal.csv",
+            ];
+            
+            for path in &paths {
+                if Path::new(path).exists() {
+                    match FourHeadCalibration::from_csv(path) {
+                        Ok(cal) => {
+                            self.four_head_cal = Some(cal);
+                            return Ok(());
+                        }
+                        Err(e) => return Err(format!("Failed to load 4-head calibration from {}: {}", path, e)),
+                    }
+                }
+            }
+            
+            return Err("4-head calibration file not found in expected locations".to_string());
+        }
+        Ok(())
+    }
+
+    /// Load pump calibration from CSV file if not already loaded.
+    fn ensure_pump_calibration(&mut self) -> Result<(), String> {
+        if self.pump_cal.is_none() {
+            // Try standard paths
+            let paths = [
+                "src/gl7_calibrations/pumps_switches_cal.csv",
+                "gl7_calibrations/pumps_switches_cal.csv",
+                "../gl7_calibrations/pumps_switches_cal.csv",
+            ];
+            
+            for path in &paths {
+                if Path::new(path).exists() {
+                    match PumpCalibration::from_csv(path) {
+                        Ok(cal) => {
+                            self.pump_cal = Some(cal);
+                            return Ok(());
+                        }
+                        Err(e) => return Err(format!("Failed to load pump calibration from {}: {}", path, e)),
+                    }
+                }
+            }
+            
+            return Err("Pump calibration file not found in expected locations".to_string());
+        }
+        Ok(())
+    }
+
+    /// `SRDG? D4` + calibration → 3-pump temperature in Kelvin.
+    /// Mirrors convert_pump_voltage_to_temperature() in pump_calibration.py.
+    fn get_3pump_temperature_internal(&mut self) -> String {
+        // Ensure calibration is loaded
+        if let Err(e) = self.ensure_pump_calibration() {
+            return format!("Input D4 (3-pump): ERROR ({})", e);
+        }
+        
+        // Read voltage from Input D4
+        match self.read_sensor_raw("D4") {
+            Ok(v_str) => {
+                if let Ok(voltage) = v_str.parse::<f64>() {
+                    // Apply calibration
+                    if let Some(ref cal) = self.pump_cal {
+                        if let Some(temp_k) = cal.voltage_to_temperature(voltage) {
+                            format!("Input D4 (3-pump): {:.4} V → {:.4} K (calibrated)", voltage, temp_k)
+                        } else {
+                            format!("Input D4 (3-pump): {:.4} V → ERROR (calibration failed)", voltage)
+                        }
+                    } else {
+                        format!("Input D4 (3-pump): {:.4} V → ERROR (calibration not loaded)", voltage)
+                    }
+                } else {
+                    format!("Input D4 (3-pump): {}", v_str)
+                }
+            }
+            Err(e) => format!("Input D4 (3-pump): ERROR ({})", e),
+        }
+    }
+
+    /// `SRDG? D5` + calibration → 4-pump temperature in Kelvin.
+    /// Mirrors convert_pump_voltage_to_temperature() in pump_calibration.py.
+    fn get_4pump_temperature_internal(&mut self) -> String {
+        // Ensure calibration is loaded
+        if let Err(e) = self.ensure_pump_calibration() {
+            return format!("Input D5 (4-pump): ERROR ({})", e);
+        }
+        
+        // Read voltage from Input D5
+        match self.read_sensor_raw("D5") {
+            Ok(v_str) => {
+                if let Ok(voltage) = v_str.parse::<f64>() {
+                    // Apply calibration
+                    if let Some(ref cal) = self.pump_cal {
+                        if let Some(temp_k) = cal.voltage_to_temperature(voltage) {
+                            format!("Input D5 (4-pump): {:.4} V → {:.4} K (calibrated)", voltage, temp_k)
+                        } else {
+                            format!("Input D5 (4-pump): {:.4} V → ERROR (calibration failed)", voltage)
+                        }
+                    } else {
+                        format!("Input D5 (4-pump): {:.4} V → ERROR (calibration not loaded)", voltage)
+                    }
+                } else {
+                    format!("Input D5 (4-pump): {}", v_str)
+                }
+            }
+            Err(e) => format!("Input D5 (4-pump): ERROR ({})", e),
+        }
+    }
+
+    /// `SRDG? C` + calibration → 4-head temperature in Kelvin.
+    /// Mirrors convert_4head_resistance_to_temperature() in head4_calibration.py.
+    fn get_4head_temperature_internal(&mut self) -> String {
+        // Ensure calibration is loaded
+        if let Err(e) = self.ensure_4head_calibration() {
+            return format!("Input C (4-head): ERROR ({})", e);
+        }
+        
+        // Read resistance from Input C
+        match self.read_sensor_raw("C") {
+            Ok(r_str) => {
+                if let Ok(resistance) = r_str.parse::<f64>() {
+                    // Apply fudge factor: add 34.56 ohms (matches Python main.py line 115)
+                    let calibrated_resistance = resistance + 34.56;
+                    
+                    // Apply calibration to corrected resistance
+                    if let Some(ref cal) = self.four_head_cal {
+                        if let Some(temp_k) = cal.resistance_to_temperature(calibrated_resistance) {
+                            format!("Input C (4-head): {:.4} Ω (raw), {:.4} Ω (calibrated) → {:.4} K", resistance, calibrated_resistance, temp_k)
+                        } else {
+                            format!("Input C (4-head): {:.4} Ω (raw), {:.4} Ω (calibrated) → ERROR (calibration failed)", resistance, calibrated_resistance)
+                        }
+                    } else {
+                        format!("Input C (4-head): {:.4} Ω → ERROR (calibration not loaded)", resistance)
+                    }
+                } else {
+                    format!("Input C (4-head): {}", r_str)
+                }
+            }
+            Err(e) => format!("Input C (4-head): ERROR ({})", e),
+        }
+    }
+
+    /// `SRDG? A` + calibration → 3-head temperature in Kelvin.
+    /// Mirrors convert_3head_resistance_to_temperature() in head3_calibration.py.
+    fn get_3head_temperature_internal(&mut self) -> String {
+        // Ensure calibration is loaded
+        if let Err(e) = self.ensure_3head_calibration() {
+            return format!("Input A (3-head): ERROR ({})", e);
+        }
+        
+        // Read resistance from Input A
+        match self.read_sensor_raw("A") {
+            Ok(r_str) => {
+                if let Ok(resistance) = r_str.parse::<f64>() {
+                    // Apply calibration
+                    if let Some(ref cal) = self.three_head_cal {
+                        if let Some(temp_k) = cal.resistance_to_temperature(resistance) {
+                            format!("Input A (3-head): {:.4} Ω → {:.4} K (calibrated)", resistance, temp_k)
+                        } else {
+                            format!("Input A (3-head): {:.4} Ω → ERROR (calibration failed)", resistance)
+                        }
+                    } else {
+                        format!("Input A (3-head): {:.4} Ω → ERROR (calibration not loaded)", resistance)
+                    }
+                } else {
+                    format!("Input A (3-head): {}", r_str)
+                }
+            }
+            Err(e) => format!("Input A (3-head): ERROR ({})", e),
+        }
+    }
+
+    /// Intelligent input reading - shows appropriate data based on input type.
+    /// Input A (3-head): resistance + calibrated temperature
+    /// Input B (ADR): resistance + Kelvin  
+    /// Input C (4-head): resistance + calibrated temperature
+    /// Input D3 (4K stage): voltage + Kelvin
+    /// Input D4 (3-pump): voltage + calibrated temperature
+    /// Input D5 (4-pump): voltage + calibrated temperature
+    /// Input D2 (switch): voltage only
+    /// Input D1: whatever the Lakeshore shows
+    pub fn read_input_intelligent(&mut self, input: &str) {
+        let input = input.to_uppercase();
+        if !ALL_INPUTS.contains(&input.as_str()) {
+            self.error_message = Some(format!(
+                "Invalid input '{}'. Must be one of: {}",
+                input,
+                ALL_INPUTS.join(", ")
+            ));
+            return;
+        }
+
+        match input.as_str() {
+            "A" => {
+                // 3-head: show resistance + calibrated temperature
+                self.output = format!("{}\n", self.get_3head_temperature_internal());
+                self.error_message = None;
+            }
+            "B" => {
+                // ADR: show resistance + Kelvin
+                let sensor = self.read_sensor_raw("B").unwrap_or_else(|e| format!("ERROR ({})", e));
+                let kelvin = self.read_kelvin_raw("B").unwrap_or_else(|e| format!("ERROR ({})", e));
+                let sensor_str = if let Ok(v) = sensor.parse::<f64>() {
+                    format!("{:.4} Ω", v)
+                } else {
+                    sensor
+                };
+                let kelvin_str = if let Ok(v) = kelvin.parse::<f64>() {
+                    format!("{:.4} K", v)
+                } else {
+                    kelvin
+                };
+                self.output = format!("Input B (ADR): {} → {}\n", sensor_str, kelvin_str);
+                self.error_message = None;
+            }
+            "C" => {
+                // 4-head: show resistance + calibrated temperature
+                self.output = format!("{}\n", self.get_4head_temperature_internal());
+                self.error_message = None;
+            }
+            "D3" => {
+                // 4K stage: show voltage + Kelvin
+                let sensor = self.read_sensor_raw("D3").unwrap_or_else(|e| format!("ERROR ({})", e));
+                let kelvin = self.read_kelvin_raw("D3").unwrap_or_else(|e| format!("ERROR ({})", e));
+                let sensor_str = if let Ok(v) = sensor.parse::<f64>() {
+                    format!("{:.4} V", v)
+                } else {
+                    sensor
+                };
+                let kelvin_str = if let Ok(v) = kelvin.parse::<f64>() {
+                    format!("{:.4} K", v)
+                } else {
+                    kelvin
+                };
+                self.output = format!("Input D3 (4K stage): {} → {}\n", sensor_str, kelvin_str);
+                self.error_message = None;
+            }
+            "D4" => {
+                // 3-pump: show voltage + calibrated temperature
+                self.output = format!("{}\n", self.get_3pump_temperature_internal());
+                self.error_message = None;
+            }
+            "D5" => {
+                // 4-pump: show voltage + calibrated temperature
+                self.output = format!("{}\n", self.get_4pump_temperature_internal());
+                self.error_message = None;
+            }
+            _ => {
+                // Other inputs: show sensor reading only
+                match self.read_sensor_raw(&input) {
+                    Ok(r) => {
+                        let unit = sensor_unit(&input);
+                        self.output = if let Ok(v) = r.parse::<f64>() {
+                            format!("Input {}: {:.4} {}\n", input, v, unit)
+                        } else {
+                            format!("Input {}: {}\n", input, r)
+                        };
+                        self.error_message = None;
+                    }
+                    Err(e) => self.error_message = Some(e),
+                }
+            }
+        }
     }
 
     // ── Raw command ───────────────────────────────────────────
@@ -369,6 +945,173 @@ impl LakeShore350Controller {
             }
             Err(e) => self.error_message = Some(e),
         }
+    }
+
+    // ── Outputs (heaters + analog) ────────────────────────────
+
+    /// `RANGE <output>,<range>` — set output range for output 1–4.
+    /// Mirrors `set_heater_range()` in outputs.py.
+    pub fn set_output_range(&mut self, output_num: u8, range_val: i32) {
+        if let Err(e) = Self::validate_output(output_num) {
+            self.error_message = Some(e);
+            return;
+        }
+        match self.send_write_command(&format!("RANGE {output_num},{range_val}")) {
+            Ok(()) => {
+                self.output = format!("Sent: RANGE {output_num},{range_val}\n");
+                self.error_message = None;
+            }
+            Err(e) => self.error_message = Some(e),
+        }
+    }
+
+    /// `MOUT <output>,<percent>` — set manual output percentage.
+    /// Mirrors `set_outputs()` in outputs.py.
+    pub fn set_output_percent(&mut self, output_num: u8, percent: f64) {
+        if let Err(e) = Self::validate_output(output_num) {
+            self.error_message = Some(e);
+            return;
+        }
+        if !(0.0..=100.0).contains(&percent) {
+            self.error_message = Some("Percent must be between 0 and 100.".to_string());
+            return;
+        }
+        match self.send_write_command(&format!("MOUT {output_num},{percent}")) {
+            Ok(()) => {
+                self.output = format!("Set Output {output_num} to {percent}%\n");
+                self.error_message = None;
+            }
+            Err(e) => self.error_message = Some(e),
+        }
+    }
+
+    /// `HTRSET` or `ANALOG` — set output configuration parameters.
+    /// Outputs 1–2 use `HTRSET <output>,<r>,<imax>,<imax_user>,<mode>`.
+    /// Outputs 3–4 use `ANALOG <output>,<input>,<units>,<high>,<low>,<polarity>`.
+    /// Mirrors `set_output_params()` in outputs.py.
+    pub fn set_output_params(&mut self, output_num: u8, params: &[String]) {
+        if let Err(e) = Self::validate_output(output_num) {
+            self.error_message = Some(e);
+            return;
+        }
+        let expected = if output_num <= 2 { 4 } else { 5 };
+        if params.len() != expected {
+            self.error_message = Some(format!(
+                "Expected {expected} parameter(s) for output {output_num}."
+            ));
+            return;
+        }
+        let param_str = params.join(",");
+        let cmd = if output_num <= 2 {
+            format!("HTRSET {output_num},{param_str}")
+        } else {
+            format!("ANALOG {output_num},{param_str}")
+        };
+        match self.send_write_command(&cmd) {
+            Ok(()) => {
+                self.output = format!("Sent: {cmd}\n");
+                self.error_message = None;
+            }
+            Err(e) => self.error_message = Some(e),
+        }
+    }
+
+    /// Query output status using MOUT, OUTMODE, HTRSET/HTR, AOUT/ANALOG, RANGE.
+    /// Mirrors `query_outputs()` in outputs.py.
+    pub fn query_output(&mut self, output_num: u8) {
+        if let Err(e) = Self::validate_output(output_num) {
+            self.error_message = Some(e);
+            return;
+        }
+
+        let mut out = String::new();
+        let mut last_err: Option<String> = None;
+
+        match self.send_command(&format!("MOUT? {output_num}")) {
+            Ok(r) => out.push_str(&format!(
+                "MOUT (Manual Output Percentage) {output_num} Status: {r}\n"
+            )),
+            Err(e) => {
+                out.push_str(&format!("MOUT? {output_num}: ERROR ({e})\n"));
+                last_err = Some(e);
+            }
+        }
+
+        if output_num <= 2 {
+            match self.send_command(&format!("HTR? {output_num}")) {
+                Ok(r) => out.push_str(&format!("HTR? {output_num} : {r}\n")),
+                Err(e) => {
+                    out.push_str(&format!("HTR? {output_num}: ERROR ({e})\n"));
+                    last_err = Some(e);
+                }
+            }
+            match self.send_command(&format!("HTRSET? {output_num}")) {
+                Ok(r) => out.push_str(&format!(
+                    "HTRSET? (<htr resistance>,<max current>,<max user current>,<current/power>) {output_num} : {r}\n"
+                )),
+                Err(e) => {
+                    out.push_str(&format!("HTRSET? {output_num}: ERROR ({e})\n"));
+                    last_err = Some(e);
+                }
+            }
+        } else {
+            match self.send_command(&format!("AOUT? {output_num}")) {
+                Ok(r) => out.push_str(&format!("AOUT? {output_num} Status: {r}\n")),
+                Err(e) => {
+                    out.push_str(&format!("AOUT? {output_num}: ERROR ({e})\n"));
+                    last_err = Some(e);
+                }
+            }
+            match self.send_command(&format!("ANALOG? {output_num}")) {
+                Ok(r) => out.push_str(&format!("ANALOG? {output_num} Status: {r}\n")),
+                Err(e) => {
+                    out.push_str(&format!("ANALOG? {output_num}: ERROR ({e})\n"));
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        match self.send_command(&format!("OUTMODE? {output_num}")) {
+            Ok(r) => out.push_str(&format!("OUTMODE? {output_num} Status: {r}\n")),
+            Err(e) => {
+                out.push_str(&format!("OUTMODE? {output_num}: ERROR ({e})\n"));
+                last_err = Some(e);
+            }
+        }
+
+        match self.send_command(&format!("RANGE? {output_num}")) {
+            Ok(r) => out.push_str(&format!("RANGE? {output_num} Status: {r}\n")),
+            Err(e) => {
+                out.push_str(&format!("RANGE? {output_num}: ERROR ({e})\n"));
+                last_err = Some(e);
+            }
+        }
+
+        self.output = out;
+        self.error_message = last_err;
+    }
+
+    /// Query output status for all outputs 1–4.
+    /// Mirrors calling `query_outputs()` for each output in outputs.py.
+    pub fn query_all_outputs(&mut self) {
+        let mut out = String::new();
+        let mut last_err: Option<String> = None;
+
+        for &output_num in &ALL_OUTPUTS {
+            self.query_output(output_num);
+            out.push_str(&format!("Output {output_num}:\n"));
+            out.push_str(&self.output);
+            if !self.output.ends_with('\n') {
+                out.push('\n');
+            }
+            if let Some(e) = self.error_message.clone() {
+                last_err = Some(e);
+            }
+            out.push('\n');
+        }
+
+        self.output = out;
+        self.error_message = last_err;
     }
 }
 

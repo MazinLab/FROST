@@ -279,11 +279,9 @@ enum Lakeshore370Cmd {
 enum Lakeshore350Cmd {
     /// Get device identification (*IDN?)
     Identify,
-    /// Read raw sensor value for one input: A, B, C, D1–D5 (SRDG?)
-    Sensor { input: String },
-    /// Read temperature in Kelvin for one input: A, B, C, D1–D5 (KRDG?)
-    Kelvin { input: String },
-    /// Read B (ADR) and D2 (4K stage): sensor + Kelvin for each
+    /// Read sensor/temperature for one input: A, B, C, D1–D5 (intelligent reading)
+    Read { input: String },
+    /// Read all key inputs: A (3-head), B (ADR), C (4-head), D3 (4K stage), D4 (3-pump), D5 (4-pump)
     All,
     /// Get front panel display name for one input (INNAME?)
     /// Valid inputs: A, B, C, D1, D2, D3, D4, D5
@@ -295,6 +293,30 @@ enum Lakeshore350Cmd {
     DisplaySetName {
         input: String,
         name: String,
+    },
+    /// Set manual output percentage 0–100 (MOUT)
+    SetOutput {
+        output: u8,
+        percent: f64,
+    },
+    /// Query output status for one output (MOUT?, HTR?/HTRSET? or AOUT?/ANALOG?, OUTMODE?, RANGE?)
+    QueryOutput {
+        output: u8,
+    },
+    /// Query output status for all outputs 1–4
+    QueryAllOutputs,
+    /// Set output configuration parameters (HTRSET or ANALOG)
+    /// For output 1–2: <resistance>,<max current>,<max user current>,<current/power>
+    /// For output 3–4: <input>,<units>,<high value>,<low value>,<polarity>
+    OutputsSetParams {
+        output: u8,
+        #[arg(required = true, num_args = 1..)]
+        params: Vec<String>,
+    },
+    /// Set output range (RANGE)
+    OutputsSetRange {
+        output: u8,
+        range: i32,
     },
     /// Send a raw command string and print the response
     Raw {
@@ -689,12 +711,8 @@ fn run_lakeshore350(ctrl: &mut LakeShore350Controller, cmd: Lakeshore350Cmd) -> 
             ctrl.get_identification();
             print_ctrl(&ctrl.output, &ctrl.error_message)
         }
-        Lakeshore350Cmd::Sensor { input } => {
-            ctrl.get_sensor(&input);
-            print_ctrl(&ctrl.output, &ctrl.error_message)
-        }
-        Lakeshore350Cmd::Kelvin { input } => {
-            ctrl.get_kelvin(&input);
+        Lakeshore350Cmd::Read { input } => {
+            ctrl.read_input_intelligent(&input);
             print_ctrl(&ctrl.output, &ctrl.error_message)
         }
         Lakeshore350Cmd::All => {
@@ -713,6 +731,26 @@ fn run_lakeshore350(ctrl: &mut LakeShore350Controller, cmd: Lakeshore350Cmd) -> 
             ctrl.set_display_name(&input, &name)?;
             println!("Display name for input {} set to '{}'.", input, name);
             Ok(())
+        }
+        Lakeshore350Cmd::SetOutput { output, percent } => {
+            ctrl.set_output_percent(output, percent);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::QueryOutput { output } => {
+            ctrl.query_output(output);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::QueryAllOutputs => {
+            ctrl.query_all_outputs();
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::OutputsSetParams { output, params } => {
+            ctrl.set_output_params(output, &params);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
+        }
+        Lakeshore350Cmd::OutputsSetRange { output, range } => {
+            ctrl.set_output_range(output, range);
+            print_ctrl(&ctrl.output, &ctrl.error_message)
         }
         Lakeshore350Cmd::Raw { command } => {
             let cmd_str = command.join(" ");
