@@ -84,6 +84,12 @@ enum Device {
         #[command(subcommand)]
         command: Lakeshore350Cmd,
     },
+
+    /// Record temperatures from LS350 and LS370 to a date-stamped CSV in FROST/temps
+    RecordTemps {
+        #[command(subcommand)]
+        command: RecordTempsCmd,
+    },
 }
 
 // ── Compressor subcommands ────────────────────────────────────
@@ -325,6 +331,19 @@ enum Lakeshore350Cmd {
     },
 }
 
+// ── RecordTemps subcommands ───────────────────────────────────────
+#[derive(Subcommand)]
+enum RecordTempsCmd {
+    /// Take a single temperature snapshot and append one row to today's CSV
+    Snapshot,
+    /// Record temperatures continuously (one row every N seconds) until Ctrl+C
+    Loop {
+        /// Recording interval in seconds (default: 30)
+        #[arg(long, default_value = "30")]
+        interval: u64,
+    },
+}
+
 // ── Entry point ───────────────────────────────────────────────
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
@@ -363,6 +382,9 @@ pub fn run() -> Result<(), String> {
             ctrl.port = port;
             ctrl.baud_rate = baud;
             run_lakeshore350(&mut ctrl, command)
+        }
+        Device::RecordTemps { command } => {
+            run_record_temps(command)
         }
     }
 }
@@ -767,4 +789,32 @@ fn print_ctrl(output: &str, error: &Option<String>) -> Result<(), String> {
     }
     print!("{}", output);
     Ok(())
+}
+// ── RecordTemps dispatch ────────────────────────────────────────
+fn run_record_temps(cmd: RecordTempsCmd) -> Result<(), String> {
+    // Use the fixed defaults from each controller module
+    let mut ls350 = LakeShore350Controller::default();
+    let mut ls370 = LakeShore370Controller::default();
+    const OUTPUT_DIR: &str = "temps";
+
+    match cmd {
+        RecordTempsCmd::Snapshot => {
+            let msg = crate::record_temps::record_single_snapshot(
+                &mut ls350, &mut ls370, OUTPUT_DIR,
+            )?;
+            println!("{}", msg);
+            let record = crate::record_temps::take_snapshot(&mut ls350, &mut ls370);
+            print!("{}", record.to_display());
+            Ok(())
+        }
+        RecordTempsCmd::Loop { interval } => {
+            crate::record_temps::run_recording_loop(
+                &ls350.port, ls350.baud_rate,
+                &ls370.port, ls370.baud_rate,
+                interval,
+                OUTPUT_DIR,
+            );
+            Ok(())
+        }
+    }
 }
