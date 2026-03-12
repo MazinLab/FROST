@@ -3,6 +3,7 @@ mod heatswitch;
 mod lakeshore625;
 mod lakeshore370;
 mod lakeshore350;
+mod record_temps;
 mod gui;
 mod cli;
 
