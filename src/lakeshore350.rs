@@ -274,6 +274,39 @@ impl PumpCalibration {
     }
 }
 
+// ── Recording snapshot data ─────────────────────────────────
+/// All sensor + temperature values from every LS350 input, collected in one pass.
+pub struct Ls350RecordingData {
+    /// Input A (3-head): raw resistance in Ω.
+    pub input_a_sensor_ohm: Option<f64>,
+    /// Input A (3-head): calibrated temperature in K.
+    pub input_a_temp_k: Option<f64>,
+    /// Input B (ADR): raw resistance in Ω (SRDG?).
+    pub input_b_sensor_ohm: Option<f64>,
+    /// Input B (ADR): temperature in K (KRDG?).
+    pub input_b_temp_k: Option<f64>,
+    /// Input C (4-head): raw resistance in Ω.
+    pub input_c_sensor_ohm: Option<f64>,
+    /// Input C (4-head): calibrated temperature in K (with +34.56 Ω offset).
+    pub input_c_temp_k: Option<f64>,
+    /// Input D2 (switch): voltage in V.
+    pub input_d2_sensor_v: Option<f64>,
+    /// Input D2 (switch): calibrated temperature in K.
+    pub input_d2_temp_k: Option<f64>,
+    /// Input D3 (4K stage): voltage in V.
+    pub input_d3_sensor_v: Option<f64>,
+    /// Input D3 (4K stage): temperature in K (KRDG?).
+    pub input_d3_temp_k: Option<f64>,
+    /// Input D4 (3-pump): voltage in V.
+    pub input_d4_sensor_v: Option<f64>,
+    /// Input D4 (3-pump): calibrated temperature in K.
+    pub input_d4_temp_k: Option<f64>,
+    /// Input D5 (4-pump): voltage in V.
+    pub input_d5_sensor_v: Option<f64>,
+    /// Input D5 (4-pump): calibrated temperature in K.
+    pub input_d5_temp_k: Option<f64>,
+}
+
 // ── Controller state ──────────────────────────────────────────
 pub struct LakeShore350Controller {
     pub port: String,
@@ -714,6 +747,69 @@ impl LakeShore350Controller {
         Ok(())
     }
 
+    /// Read all inputs and return structured data for CSV recording.
+    /// Errors on individual channels are represented as `None`.
+    pub fn read_for_recording(&mut self) -> Ls350RecordingData {
+        // ── Input A (3-head): resistance Ω + calibrated K ─────────────
+        let a_sensor = self.read_sensor_raw("A").ok().and_then(|s| s.parse::<f64>().ok());
+        let _ = self.ensure_3head_calibration();
+        let a_temp = a_sensor.and_then(|r| {
+            self.three_head_cal.as_ref()?.resistance_to_temperature(r)
+        });
+
+        // ── Input B (ADR): resistance Ω + KRDG K ──────────────────────
+        let b_sensor = self.read_sensor_raw("B").ok().and_then(|s| s.parse::<f64>().ok());
+        let b_temp   = self.read_kelvin_raw("B").ok().and_then(|s| s.parse::<f64>().ok());
+
+        // ── Input C (4-head): resistance Ω + calibrated K ─────────────
+        let c_sensor = self.read_sensor_raw("C").ok().and_then(|s| s.parse::<f64>().ok());
+        let _ = self.ensure_4head_calibration();
+        let c_temp = c_sensor.and_then(|r| {
+            let adj = r + 34.56; // matches Python main.py fudge factor
+            self.four_head_cal.as_ref()?.resistance_to_temperature(adj)
+        });
+
+        // ── Input D2 (switch): voltage V + pump calibrated K ──────────
+        let d2_sensor = self.read_sensor_raw("D2").ok().and_then(|s| s.parse::<f64>().ok());
+        let _ = self.ensure_pump_calibration();
+        let d2_temp = d2_sensor.and_then(|v| {
+            self.pump_cal.as_ref()?.voltage_to_temperature(v)
+        });
+
+        // ── Input D3 (4K stage): voltage V + KRDG K ───────────────────
+        let d3_sensor = self.read_sensor_raw("D3").ok().and_then(|s| s.parse::<f64>().ok());
+        let d3_temp   = self.read_kelvin_raw("D3").ok().and_then(|s| s.parse::<f64>().ok());
+
+        // ── Input D4 (3-pump): voltage V + pump calibrated K ──────────
+        let d4_sensor = self.read_sensor_raw("D4").ok().and_then(|s| s.parse::<f64>().ok());
+        let d4_temp = d4_sensor.and_then(|v| {
+            self.pump_cal.as_ref()?.voltage_to_temperature(v)
+        });
+
+        // ── Input D5 (4-pump): voltage V + pump calibrated K ──────────
+        let d5_sensor = self.read_sensor_raw("D5").ok().and_then(|s| s.parse::<f64>().ok());
+        let d5_temp = d5_sensor.and_then(|v| {
+            self.pump_cal.as_ref()?.voltage_to_temperature(v)
+        });
+
+        Ls350RecordingData {
+            input_a_sensor_ohm: a_sensor,
+            input_a_temp_k:     a_temp,
+            input_b_sensor_ohm: b_sensor,
+            input_b_temp_k:     b_temp,
+            input_c_sensor_ohm: c_sensor,
+            input_c_temp_k:     c_temp,
+            input_d2_sensor_v:  d2_sensor,
+            input_d2_temp_k:    d2_temp,
+            input_d3_sensor_v:  d3_sensor,
+            input_d3_temp_k:    d3_temp,
+            input_d4_sensor_v:  d4_sensor,
+            input_d4_temp_k:    d4_temp,
+            input_d5_sensor_v:  d5_sensor,
+            input_d5_temp_k:    d5_temp,
+        }
+    }
+
     /// `SRDG? D4` + calibration → 3-pump temperature in Kelvin.
     /// Mirrors convert_pump_voltage_to_temperature() in pump_calibration.py.
     fn get_3pump_temperature_internal(&mut self) -> String {
@@ -771,6 +867,36 @@ impl LakeShore350Controller {
                 }
             }
             Err(e) => format!("Input D5 (4-pump): ERROR ({})", e),
+        }
+    }
+
+    /// `SRDG? D2` + calibration → switch temperature in Kelvin.
+    /// Uses the same pump calibration as D4 and D5.
+    fn get_switch_temperature_internal(&mut self) -> String {
+        // Ensure calibration is loaded
+        if let Err(e) = self.ensure_pump_calibration() {
+            return format!("Input D2 (switch): ERROR ({})", e);
+        }
+        
+        // Read voltage from Input D2
+        match self.read_sensor_raw("D2") {
+            Ok(v_str) => {
+                if let Ok(voltage) = v_str.parse::<f64>() {
+                    // Apply calibration
+                    if let Some(ref cal) = self.pump_cal {
+                        if let Some(temp_k) = cal.voltage_to_temperature(voltage) {
+                            format!("Input D2 (switch): {:.4} V → {:.4} K (calibrated)", voltage, temp_k)
+                        } else {
+                            format!("Input D2 (switch): {:.4} V → ERROR (calibration failed)", voltage)
+                        }
+                    } else {
+                        format!("Input D2 (switch): {:.4} V → ERROR (calibration not loaded)", voltage)
+                    }
+                } else {
+                    format!("Input D2 (switch): {}", v_str)
+                }
+            }
+            Err(e) => format!("Input D2 (switch): ERROR ({})", e),
         }
     }
 
@@ -905,6 +1031,11 @@ impl LakeShore350Controller {
             "D4" => {
                 // 3-pump: show voltage + calibrated temperature
                 self.output = format!("{}\n", self.get_3pump_temperature_internal());
+                self.error_message = None;
+            }
+            "D2" => {
+                // Switch: show voltage + calibrated temperature
+                self.output = format!("{}\n", self.get_switch_temperature_internal());
                 self.error_message = None;
             }
             "D5" => {
