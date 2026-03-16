@@ -177,6 +177,7 @@ impl eframe::App for FrostApp {
         self.apply_theme(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.add_space(8.0);
 
             ui.add(
@@ -265,6 +266,7 @@ impl eframe::App for FrostApp {
             // Temperature readings section
             self.update_temperatures_if_needed();
             self.show_temperature_display(ui);
+            }); // end ScrollArea
         });
     }
 }
@@ -903,9 +905,32 @@ impl FrostApp {
 
         // ── Status block ─────────────────────────────────────────
         if !self.compressor_status.is_empty() {
-            ui.strong("Compressor Status:");
             for line in self.compressor_status.lines() {
-                ui.label(line);
+                if line.starts_with("Runtime:") {
+                    continue; // omit runtime line
+                } else if line.starts_with("Running:") {
+                    let is_yes = line.contains("Yes");
+                    let color = if is_yes {
+                        egui::Color32::from_rgb(20, 140, 20)
+                    } else {
+                        egui::Color32::from_rgb(160, 30, 30)
+                    };
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(line).strong().size(22.0).color(color),
+                    ).selectable(false));
+                } else if line.starts_with("Errors/Warnings:") {
+                    let has_errors = line.contains("Yes");
+                    let color = if has_errors {
+                        egui::Color32::from_rgb(200, 80, 0)
+                    } else {
+                        egui::Color32::DARK_GREEN
+                    };
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(line).strong().size(18.0).color(color),
+                    ).selectable(false));
+                } else {
+                    ui.label(line);
+                }
             }
             ui.label(format!(
                 "Last updated: {:.1}s ago  (refreshes every 30 s)",
