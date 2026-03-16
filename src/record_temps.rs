@@ -49,6 +49,26 @@ const HEADERS: &[&str] = &[
 // Matches record_temps.py column_widths, extended for LS370
 const WIDTHS: &[usize] = &[28, 12, 12, 17, 16, 15, 17, 17, 20, 18, 20, 20, 16, 17, 16, 17, 16, 22, 18];
 
+// ── Recording-active lock file ─────────────────────────────────
+// Written by start_recording_loop(); deleted when the loop stops.
+// Survives process kills — on next launch the GUI will detect and resume.
+const LOCK_PATH: &str = "temps/.recording_active";
+
+/// Create the lock file that signals recording is in progress.
+pub fn set_recording_active() {
+    let _ = fs::write(LOCK_PATH, "");
+}
+
+/// Remove the lock file (recording has stopped).
+pub fn clear_recording_active() {
+    let _ = fs::remove_file(LOCK_PATH);
+}
+
+/// Returns true if the lock file exists (recording was active when last stopped).
+pub fn is_recording_active() -> bool {
+    Path::new(LOCK_PATH).exists()
+}
+
 // ── Data snapshot ──────────────────────────────────────────────
 pub struct TemperatureRecord {
     pub timestamp: String,
@@ -261,6 +281,7 @@ pub fn start_recording_loop(
     output_dir: &str,
 ) -> Result<(String, Arc<AtomicBool>), String> {
     let path      = get_or_create_csv(output_dir)?;
+    set_recording_active();
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
     let path_clone = path.clone();
@@ -279,6 +300,8 @@ pub fn start_recording_loop(
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
+        // Graceful stop — clean up the lock file
+        clear_recording_active();
     });
 
     Ok((path, stop_flag))

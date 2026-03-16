@@ -194,6 +194,15 @@ impl LakeShore625Controller {
         Ok(())
     }
 
+    /// `SETI?` — get the programmed target current setpoint (A).
+    pub fn get_set_current(&mut self) {
+        match self.send_command("SETI?") {
+            Ok(r) if !r.is_empty() => { self.output = format!("Set current: {} A", r); self.error_message = None; }
+            Ok(_) => self.error_message = Some("No response to SETI?".to_string()),
+            Err(e) => self.error_message = Some(e),
+        }
+    }
+
     // ── Ramp rate ────────────────────────────────────────────
 
     /// `RATE?` — get current ramp rate (A/s) into `output`.

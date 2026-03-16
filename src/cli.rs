@@ -165,6 +165,8 @@ enum Lakeshore625Cmd {
     All,
     /// Set target output current in Amps (SETI)
     SetCurrent { current: f64 },
+    /// Get the programmed target current setpoint in Amps (SETI?)
+    GetCurrent,
     /// Get current ramp rate in A/s (RATE?)
     GetRate,
     /// Set ramp rate in A/s (RATE)
@@ -401,6 +403,7 @@ fn run_compressor(ctrl: &mut CryomechController, cmd: CompressorCmd) -> Result<(
             println!("Compressor started successfully.");
             ctrl.get_status();
             print!("{}", ctrl.status_output);
+            if !ctrl.status_output.ends_with('\n') { println!(); }
             Ok(())
         }
         CompressorCmd::Stop => {
@@ -408,21 +411,25 @@ fn run_compressor(ctrl: &mut CryomechController, cmd: CompressorCmd) -> Result<(
             println!("Compressor stopped successfully.");
             ctrl.get_status();
             print!("{}", ctrl.status_output);
+            if !ctrl.status_output.ends_with('\n') { println!(); }
             Ok(())
         }
         CompressorCmd::Temperature => {
             ctrl.get_temperature()?;
             print!("{}", ctrl.all_output);
+            if !ctrl.all_output.ends_with('\n') { println!(); }
             Ok(())
         }
         CompressorCmd::Pressure => {
             ctrl.get_pressure()?;
             print!("{}", ctrl.all_output);
+            if !ctrl.all_output.ends_with('\n') { println!(); }
             Ok(())
         }
         CompressorCmd::System => {
             ctrl.get_system_info()?;
             print!("{}", ctrl.all_output);
+            if !ctrl.all_output.ends_with('\n') { println!(); }
             Ok(())
         }
         CompressorCmd::All => {
@@ -550,6 +557,10 @@ fn run_lakeshore625(ctrl: &mut LakeShore625Controller, cmd: Lakeshore625Cmd) -> 
             ctrl.set_current(current)?;
             println!("Target current set to {} A.", current);
             Ok(())
+        }
+        Lakeshore625Cmd::GetCurrent => {
+            ctrl.get_set_current();
+            print_ctrl(&ctrl.output, &ctrl.error_message)
         }
         Lakeshore625Cmd::GetRate => {
             ctrl.get_ramp_rate();
@@ -788,6 +799,9 @@ fn print_ctrl(output: &str, error: &Option<String>) -> Result<(), String> {
         return Err(e.clone());
     }
     print!("{}", output);
+    if !output.ends_with('\n') {
+        println!();
+    }
     Ok(())
 }
 // ── RecordTemps dispatch ────────────────────────────────────────
@@ -804,7 +818,9 @@ fn run_record_temps(cmd: RecordTempsCmd) -> Result<(), String> {
             )?;
             println!("{}", msg);
             let record = crate::record_temps::take_snapshot(&mut ls350, &mut ls370);
-            print!("{}", record.to_display());
+            let display = record.to_display();
+            print!("{}", display);
+            if !display.ends_with('\n') { println!(); }
             Ok(())
         }
         RecordTempsCmd::Loop { interval } => {

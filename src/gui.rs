@@ -4,6 +4,7 @@ use eframe::egui;
 use crate::compressor::CryomechController;
 use crate::lakeshore350::LakeShore350Controller;
 use crate::lakeshore370::LakeShore370Controller;
+use crate::lakeshore625::LakeShore625Controller;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
@@ -74,6 +75,32 @@ struct FrostApp {
     last_compressor_update: Instant,
     /// Any error from the last compressor start/stop attempt.
     compressor_error: Option<String>,
+    // ── Magnet / ADR ─────────────────────────────────────────
+    lakeshore_625: LakeShore625Controller,
+    /// Target current for the ramp (A); defaults to 9.44 A.
+    magnet_target_current: f64,
+    /// Cached output of the last `get_limits()` call.
+    magnet_limits: String,
+    /// Timestamp of the last magnet limits poll.
+    last_magnet_limits_update: Instant,
+    /// Any error from the last magnet ramp attempt.
+    magnet_error: Option<String>,
+    /// Editable limit fields (populated from LIMIT? and sent via LIMIT).
+    magnet_edit_current_limit: f64,
+    magnet_edit_voltage_limit: f64,
+    magnet_edit_rate_limit: f64,
+    /// Error/success message from the last "Set Limits" action.
+    magnet_limits_set_msg: Option<Result<(), String>>,
+    /// Editable ramp rate (A/s), synced from RATE?.
+    magnet_edit_ramp_rate: f64,
+    /// Error/success from the last "Set Rate" action.
+    magnet_rate_set_msg: Option<Result<(), String>>,
+    /// Editable compliance voltage (V), synced from SETV?.
+    magnet_edit_compliance_voltage: f64,
+    /// Error/success from the last "Set Compliance" action.
+    magnet_compliance_set_msg: Option<Result<(), String>>,
+    /// Cached quench detection status (QNCH?).
+    magnet_quench_status: String,
 }
 
 #[derive(Default)]
@@ -91,20 +118,49 @@ struct TemperatureReadings {
 
 impl Default for FrostApp {
     fn default() -> Self {
+        // Resume recording if a session was active when the GUI was last closed.
+        let (recording_stop_flag, recording_csv_path, record_result) =
+            if crate::record_temps::is_recording_active() {
+                match crate::record_temps::start_recording_loop(30, "temps") {
+                    Ok((path, flag)) => (
+                        Some(flag),
+                        Some(path.clone()),
+                        Some(Ok(format!("Resumed recording → {}", path))),
+                    ),
+                    Err(e) => (None, None, Some(Err(e))),
+                }
+            } else {
+                (None, None, None)
+            };
+
         Self {
             selected_theme: Theme::EguiLightBlue,
             lakeshore_350: LakeShore350Controller::default(),
             lakeshore_370: LakeShore370Controller::default(),
             temperatures: TemperatureReadings::default(),
-            last_temp_update: Instant::now() - Duration::from_secs(10), // Force initial update
-            record_result: None,
-            recording_stop_flag: None,
-            recording_csv_path: None,
+            last_temp_update: Instant::now() - Duration::from_secs(10),
+            record_result,
+            recording_stop_flag,
+            recording_csv_path,
             compressor: CryomechController::default(),
-            compressor_running: false,
+            compressor_running: false,   // synced on first status poll
             compressor_status: String::new(),
             last_compressor_update: Instant::now() - Duration::from_secs(35),
             compressor_error: None,
+            lakeshore_625: LakeShore625Controller::default(),
+            magnet_target_current: 9.44,
+            magnet_limits: String::new(),
+            last_magnet_limits_update: Instant::now() - Duration::from_secs(35),
+            magnet_error: None,
+            magnet_edit_current_limit: 10.0,
+            magnet_edit_voltage_limit: 1.0,
+            magnet_edit_rate_limit: 0.1,
+            magnet_limits_set_msg: None,
+            magnet_edit_ramp_rate: 0.01,
+            magnet_rate_set_msg: None,
+            magnet_edit_compliance_voltage: 1.0,
+            magnet_compliance_set_msg: None,
+            magnet_quench_status: String::new(),
         }
     }
 }
@@ -174,6 +230,14 @@ impl eframe::App for FrostApp {
             // Compressor section
             self.update_compressor_status_if_needed();
             self.show_compressor_section(ui);
+
+            ui.add_space(20.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // Magnet / ADR section
+            self.update_magnet_limits_if_needed();
+            self.show_magnet_section(ui);
 
             ui.add_space(20.0);
             ui.separator();
@@ -312,6 +376,294 @@ impl FrostApp {
         ctx.set_style(style);
     }
 
+    /// Poll magnet limits, ramp rate, compliance voltage, and set-current every 30 seconds.
+    fn update_magnet_limits_if_needed(&mut self) {
+        if self.last_magnet_limits_update.elapsed() >= Duration::from_secs(30) {
+            // LIMIT?
+            self.lakeshore_625.get_limits();
+            if let Some(e) = &self.lakeshore_625.error_message.clone() {
+                self.magnet_limits = format!("Error: {}", e);
+            } else {
+                let output = self.lakeshore_625.output.clone();
+                self.magnet_limits = output.clone();
+                if let Some((c, v, r)) = parse_limits_from_output(&output) {
+                    self.magnet_edit_current_limit = c;
+                    self.magnet_edit_voltage_limit = v;
+                    self.magnet_edit_rate_limit = r;
+                }
+            }
+            // SETI? — sync target current box
+            self.lakeshore_625.get_set_current();
+            if self.lakeshore_625.error_message.is_none() {
+                let out = self.lakeshore_625.output.clone();
+                if let Some(val) = parse_single_value(&out) {
+                    self.magnet_target_current = val;
+                }
+            }
+            // RATE?
+            self.lakeshore_625.get_ramp_rate();
+            if self.lakeshore_625.error_message.is_none() {
+                let out = self.lakeshore_625.output.clone();
+                if let Some(val) = parse_single_value(&out) {
+                    self.magnet_edit_ramp_rate = val;
+                }
+            }
+            // SETV?
+            self.lakeshore_625.get_compliance_voltage();
+            if self.lakeshore_625.error_message.is_none() {
+                let out = self.lakeshore_625.output.clone();
+                if let Some(val) = parse_single_value(&out) {
+                    self.magnet_edit_compliance_voltage = val;
+                }
+            }
+            // QNCH?
+            self.lakeshore_625.get_quench_status();
+            if self.lakeshore_625.error_message.is_none() {
+                self.magnet_quench_status = self.lakeshore_625.output.clone();
+            }
+            self.last_magnet_limits_update = Instant::now();
+        }
+    }
+
+    /// Draw the Magnet / ADR ramp controls and limits block.
+    fn show_magnet_section(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Magnet / ADR")
+                    .size(32.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(40, 40, 140)),
+            )
+            .selectable(false),
+        );
+        ui.add_space(6.0);
+
+        // ── Ramp controls ────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.label("Target Current (A):");
+            ui.add(
+                egui::DragValue::new(&mut self.magnet_target_current)
+                    .speed(0.01)
+                    .clamp_range(0.0_f64..=60.1_f64)
+                    .fixed_decimals(2),
+            );
+
+            ui.add_space(8.0);
+
+            let btn = egui::Button::new(
+                egui::RichText::new("▶  Ramp Magnet").strong(),
+            )
+            .fill(egui::Color32::from_rgb(40, 80, 170));
+
+            if ui.add(btn).clicked() {
+                let target = self.magnet_target_current;
+                match self.lakeshore_625.set_current(target) {
+                    Ok(()) => {
+                        self.magnet_error = None;
+                        // Refresh limits immediately after ramping
+                        self.lakeshore_625.get_limits();
+                        if self.lakeshore_625.error_message.is_none() {
+                            self.magnet_limits = self.lakeshore_625.output.clone();
+                        }
+                        self.last_magnet_limits_update = Instant::now();
+                    }
+                    Err(e) => self.magnet_error = Some(e),
+                }
+            }
+        });
+
+        // Error line
+        if let Some(ref e) = self.magnet_error {
+            ui.colored_label(egui::Color32::RED, format!("Magnet error: {}", e));
+        }
+
+        ui.add_space(6.0);
+
+        // ── Two-column settings block ─────────────────────────────
+        ui.columns(2, |cols| {
+            // ── Left column: Ramp rate & Compliance voltage ──────
+            cols[0].strong("Ramp Rate & Compliance");
+            cols[0].add_space(4.0);
+
+            egui::Grid::new("magnet_ramp_grid")
+                .num_columns(4)
+                .spacing([8.0, 6.0])
+                .show(&mut cols[0], |ui| {
+                    // Ramp rate row
+                    ui.label("Ramp rate:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.magnet_edit_ramp_rate)
+                            .speed(0.001)
+                            .clamp_range(0.0001_f64..=99.999_f64)
+                            .fixed_decimals(4),
+                    );
+                    ui.label("A/s");
+                    let rate_btn = egui::Button::new(egui::RichText::new("Set Rate").strong())
+                        .fill(egui::Color32::from_rgb(80, 120, 60));
+                    if ui.add(rate_btn).clicked() {
+                        let r = self.magnet_edit_ramp_rate;
+                        match self.lakeshore_625.set_ramp_rate(r) {
+                            Ok(()) => {
+                                self.lakeshore_625.get_ramp_rate();
+                                if self.lakeshore_625.error_message.is_none() {
+                                    let out = self.lakeshore_625.output.clone();
+                                    if let Some(val) = parse_single_value(&out) {
+                                        self.magnet_edit_ramp_rate = val;
+                                    }
+                                }
+                                self.magnet_rate_set_msg = Some(Ok(()));
+                            }
+                            Err(e) => self.magnet_rate_set_msg = Some(Err(e)),
+                        }
+                    }
+                    ui.end_row();
+
+                    // Rate feedback
+                    ui.label("");
+                    if let Some(ref msg) = self.magnet_rate_set_msg.clone() {
+                        match msg {
+                            Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Rate set."); }
+                            Err(e) => { ui.colored_label(egui::Color32::RED, e.as_str()); }
+                        }
+                    }
+                    ui.end_row();
+
+                    // Compliance voltage row
+                    ui.label("Compliance V:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.magnet_edit_compliance_voltage)
+                            .speed(0.01)
+                            .clamp_range(0.1_f64..=5.0_f64)
+                            .fixed_decimals(2),
+                    );
+                    ui.label("V");
+                    let comp_btn = egui::Button::new(egui::RichText::new("Set Compliance").strong())
+                        .fill(egui::Color32::from_rgb(80, 120, 60));
+                    if ui.add(comp_btn).clicked() {
+                        let v = self.magnet_edit_compliance_voltage;
+                        match self.lakeshore_625.set_compliance_voltage(v) {
+                            Ok(()) => {
+                                self.lakeshore_625.get_compliance_voltage();
+                                if self.lakeshore_625.error_message.is_none() {
+                                    let out = self.lakeshore_625.output.clone();
+                                    if let Some(val) = parse_single_value(&out) {
+                                        self.magnet_edit_compliance_voltage = val;
+                                    }
+                                }
+                                self.magnet_compliance_set_msg = Some(Ok(()));
+                            }
+                            Err(e) => self.magnet_compliance_set_msg = Some(Err(e)),
+                        }
+                    }
+                    ui.end_row();
+
+                    // Compliance feedback
+                    ui.label("");
+                    if let Some(ref msg) = self.magnet_compliance_set_msg.clone() {
+                        match msg {
+                            Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Compliance set."); }
+                            Err(e) => { ui.colored_label(egui::Color32::RED, e.as_str()); }
+                        }
+                    }
+                    ui.end_row();
+                });
+
+            // ── Right column: Limits ─────────────────────────────
+            cols[1].strong("Limits (LIMIT?)");
+
+            if self.magnet_limits.starts_with("Error:") {
+                cols[1].colored_label(egui::Color32::RED, &self.magnet_limits.clone());
+            } else if self.magnet_limits.is_empty() {
+                cols[1].label("(pending first poll…)");
+            }
+
+            egui::Grid::new("magnet_limits_grid")
+                .num_columns(3)
+                .spacing([8.0, 4.0])
+                .show(&mut cols[1], |ui| {
+                    ui.label("Current limit:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.magnet_edit_current_limit)
+                            .speed(0.1)
+                            .clamp_range(0.0_f64..=60.1_f64)
+                            .fixed_decimals(2),
+                    );
+                    ui.label("A");
+                    ui.end_row();
+
+                    ui.label("Voltage limit:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.magnet_edit_voltage_limit)
+                            .speed(0.01)
+                            .clamp_range(0.1_f64..=5.0_f64)
+                            .fixed_decimals(2),
+                    );
+                    ui.label("V");
+                    ui.end_row();
+
+                    ui.label("Rate limit:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.magnet_edit_rate_limit)
+                            .speed(0.001)
+                            .clamp_range(0.0001_f64..=99.999_f64)
+                            .fixed_decimals(4),
+                    );
+                    ui.label("A/s");
+                    ui.end_row();
+                });
+
+            // Set Limits button — wrapped in horizontal so it never stretches full column width
+            cols[1].horizontal(|ui| {
+                let set_btn = egui::Button::new(egui::RichText::new("Set Limits").strong())
+                    .fill(egui::Color32::from_rgb(80, 120, 60));
+                if ui.add(set_btn).clicked() {
+                    let c = self.magnet_edit_current_limit;
+                    let v = self.magnet_edit_voltage_limit;
+                    let r = self.magnet_edit_rate_limit;
+                    match self.lakeshore_625.set_limits(c, v, r) {
+                        Ok(()) => {
+                            self.lakeshore_625.get_limits();
+                            if self.lakeshore_625.error_message.is_none() {
+                                let output = self.lakeshore_625.output.clone();
+                                self.magnet_limits = output.clone();
+                                if let Some((pc, pv, pr)) = parse_limits_from_output(&output) {
+                                    self.magnet_edit_current_limit = pc;
+                                    self.magnet_edit_voltage_limit = pv;
+                                    self.magnet_edit_rate_limit = pr;
+                                }
+                            }
+                            self.last_magnet_limits_update = Instant::now();
+                            self.magnet_limits_set_msg = Some(Ok(()));
+                        }
+                        Err(e) => self.magnet_limits_set_msg = Some(Err(e)),
+                    }
+                }
+                if let Some(ref msg) = self.magnet_limits_set_msg.clone() {
+                    match msg {
+                        Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Limits updated."); }
+                        Err(e) => { ui.colored_label(egui::Color32::RED, format!("Error: {}", e)); }
+                    }
+                }
+            });
+
+            // Quench status printout
+            if !self.magnet_quench_status.is_empty() {
+                cols[1].add_space(4.0);
+                for line in self.magnet_quench_status.lines() {
+                    cols[1].label(line);
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+        if !self.magnet_limits.is_empty() && !self.magnet_limits.starts_with("Error:") {
+            ui.label(format!(
+                "Last updated: {:.1}s ago  (refreshes every 30 s)",
+                self.last_magnet_limits_update.elapsed().as_secs_f32()
+            ));
+        }
+    }
+
     /// Update temperature readings every 30 seconds
     fn update_temperatures_if_needed(&mut self) {
         if self.last_temp_update.elapsed() >= Duration::from_secs(30) {
@@ -334,8 +686,8 @@ impl FrostApp {
         // Input C (4-head) - uses calibration  
         self.temperatures.ls350_c = self.read_350_temperature_kelvin("C");
         
-        // Input D2 (Switch voltage) - voltage only, no temperature
-        self.temperatures.ls350_d2 = "N/A (voltage only)".to_string();
+        // Input D2 (Switch) - voltage sensor, converted to temperature
+        self.temperatures.ls350_d2 = self.read_350_temperature_kelvin("D2");
         
         // Input D3 (4K stage) - uses KRDG?
         self.temperatures.ls350_d3 = self.read_350_temperature_kelvin("D3");
@@ -413,6 +765,10 @@ impl FrostApp {
                 self.compressor_status = format!("Error: {}", e);
             } else {
                 self.compressor_status = self.compressor.status_output.clone();
+                // Sync running state from the hardware response
+                self.compressor_running = self.compressor.status_output
+                    .lines()
+                    .any(|l| l.contains("Running:") && l.contains("Yes"));
             }
             self.last_compressor_update = Instant::now();
         }
@@ -517,6 +873,7 @@ impl FrostApp {
                         flag.store(true, Ordering::Relaxed);
                     }
                     self.recording_stop_flag = None;
+                    crate::record_temps::clear_recording_active();
                     self.record_result = Some(Ok(
                         format!("Recording stopped. File: {}",
                             self.recording_csv_path.as_deref().unwrap_or("unknown"))
@@ -619,5 +976,38 @@ impl FrostApp {
         ui.add_space(8.0);
         ui.label(format!("Last updated: {:.1}s ago", elapsed));
         ui.label("Updates every 30 seconds");
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+
+/// Extracts a single f64 from strings like:
+///   "Set current: 9.44 A"  →  9.44
+///   "Ramp rate: 0.0100 A/s"  →  0.01
+///   "Compliance voltage: 1.0 V"  →  1.0
+/// (always the third whitespace-separated token)
+fn parse_single_value(output: &str) -> Option<f64> {
+    output.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// Parse the formatted output of `get_limits()` into (current, voltage, rate).
+/// Expected format:
+///   "Current limit: X A\nVoltage limit: Y V\nRate limit:    Z A/s"
+fn parse_limits_from_output(output: &str) -> Option<(f64, f64, f64)> {
+    let mut current = None;
+    let mut voltage = None;
+    let mut rate = None;
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("Current") => { current = parts.nth(1).and_then(|s| s.parse().ok()); }
+            Some("Voltage") => { voltage = parts.nth(1).and_then(|s| s.parse().ok()); }
+            Some("Rate")    => { rate    = parts.nth(1).and_then(|s| s.parse().ok()); }
+            _ => {}
+        }
+    }
+    match (current, voltage, rate) {
+        (Some(c), Some(v), Some(r)) => Some((c, v, r)),
+        _ => None,
     }
 }
