@@ -101,6 +101,10 @@ struct FrostApp {
     magnet_compliance_set_msg: Option<Result<(), String>>,
     /// Cached quench detection status (QNCH?).
     magnet_quench_status: String,
+    /// Live readback values polled every 30 s (RDGI?, RDGV?, RDGF?).
+    magnet_live_current: String,
+    magnet_live_voltage: String,
+    magnet_live_field: String,
 }
 
 #[derive(Default)]
@@ -161,6 +165,9 @@ impl Default for FrostApp {
             magnet_edit_compliance_voltage: 1.0,
             magnet_compliance_set_msg: None,
             magnet_quench_status: String::new(),
+            magnet_live_current: String::new(),
+            magnet_live_voltage: String::new(),
+            magnet_live_field: String::new(),
         }
     }
 }
@@ -421,6 +428,10 @@ impl FrostApp {
             if self.lakeshore_625.error_message.is_none() {
                 self.magnet_quench_status = self.lakeshore_625.output.clone();
             }
+            // Live readings: RDGI?, RDGV?, RDGF?
+            if let Ok(v) = self.lakeshore_625.get_current() { self.magnet_live_current = v; }
+            if let Ok(v) = self.lakeshore_625.get_voltage() { self.magnet_live_voltage = v; }
+            if let Ok(v) = self.lakeshore_625.get_field()   { self.magnet_live_field   = v; }
             self.last_magnet_limits_update = Instant::now();
         }
     }
@@ -437,6 +448,61 @@ impl FrostApp {
             .selectable(false),
         );
         ui.add_space(6.0);
+
+        // ── Live readback cards ───────────────────────────────────
+        {
+            let current_str = if self.magnet_live_current.is_empty() {
+                "—".to_string()
+            } else {
+                format!("{} A", self.magnet_live_current)
+            };
+            let voltage_str = if self.magnet_live_voltage.is_empty() {
+                "—".to_string()
+            } else {
+                format!("{} V", self.magnet_live_voltage)
+            };
+            let field_str = if self.magnet_live_field.is_empty() {
+                "—".to_string()
+            } else {
+                format!("{} T", self.magnet_live_field)
+            };
+
+            let cards: &[(&str, &str, &str)] = &[
+                ("Output Current", "LS625 · RDGI?", &current_str),
+                ("Output Voltage", "LS625 · RDGV?", &voltage_str),
+                ("Magnetic Field", "LS625 · RDGF?", &field_str),
+            ];
+
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                for &(name, id, val) in cards {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(218, 235, 218))
+                        .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 140, 80)))
+                        .rounding(egui::Rounding::same(8.0))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(130.0);
+                            ui.vertical(|ui| {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(name).strong().size(14.0),
+                                ).selectable(false));
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(id)
+                                        .size(10.5)
+                                        .color(egui::Color32::from_gray(110)),
+                                ).selectable(false));
+                                ui.add_space(4.0);
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(val).size(13.0).monospace(),
+                                ).selectable(false));
+                            });
+                        });
+                }
+            });
+        }
+
+        ui.add_space(8.0);
 
         // ── Ramp controls ────────────────────────────────────────
         ui.horizontal(|ui| {
