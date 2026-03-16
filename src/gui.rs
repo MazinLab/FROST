@@ -114,6 +114,9 @@ struct FrostApp {
     gl7_edit_pct: Vec<f64>,
     /// Per-output feedback from the last "Set Heater Output" click.
     gl7_set_msg: Vec<Option<Result<(), String>>>,
+    /// Global serial gate: no poll may start before this Instant.
+    /// Prevents two sections from hitting serial ports simultaneously.
+    serial_gate: Instant,
 }
 
 #[derive(Default)]
@@ -151,19 +154,22 @@ impl Default for FrostApp {
             lakeshore_350: LakeShore350Controller::default(),
             lakeshore_370: LakeShore370Controller::default(),
             temperatures: TemperatureReadings::default(),
-            last_temp_update: Instant::now() - Duration::from_secs(10),
+            // Staggered: fires ~28 s after compressor
+            last_temp_update: Instant::now() - Duration::from_secs(2),
             record_result,
             recording_stop_flag,
             recording_csv_path,
             compressor: CryomechController::default(),
             compressor_running: false,   // synced on first status poll
             compressor_status: String::new(),
+            // Fires immediately (first poll on startup)
             last_compressor_update: Instant::now() - Duration::from_secs(35),
             compressor_error: None,
             lakeshore_625: LakeShore625Controller::default(),
             magnet_target_current: 9.44,
             magnet_limits: String::new(),
-            last_magnet_limits_update: Instant::now() - Duration::from_secs(35),
+            // Staggered: fires ~10 s after compressor (compressor fires immediately at -35s)
+            last_magnet_limits_update: Instant::now() - Duration::from_secs(22),
             magnet_error: None,
             magnet_edit_current_limit: 10.0,
             magnet_edit_voltage_limit: 1.0,
@@ -178,9 +184,11 @@ impl Default for FrostApp {
             magnet_live_voltage: String::new(),
             magnet_live_field: String::new(),
             gl7_output_lines: vec![(String::new(), String::new()); 4],
-            last_gl7_update: Instant::now() - Duration::from_secs(35),
+            // Staggered: fires ~20 s after compressor
+            last_gl7_update: Instant::now() - Duration::from_secs(12),
             gl7_edit_pct: vec![0.0; 4],
             gl7_set_msg: vec![None, None, None, None],
+            serial_gate: Instant::now(),
         }
     }
 }
@@ -408,7 +416,11 @@ impl FrostApp {
 
     /// Poll magnet limits, ramp rate, compliance voltage, and set-current every 30 seconds.
     fn update_magnet_limits_if_needed(&mut self) {
-        if self.last_magnet_limits_update.elapsed() >= Duration::from_secs(30) {
+        if self.last_magnet_limits_update.elapsed() >= Duration::from_secs(30)
+            && Instant::now() >= self.serial_gate
+        {
+            // ~8 commands × 200 ms each → reserve 5 s on the gate
+            self.serial_gate = Instant::now() + Duration::from_secs(5);
             // LIMIT?
             self.lakeshore_625.get_limits();
             if let Some(e) = &self.lakeshore_625.error_message.clone() {
@@ -755,7 +767,11 @@ impl FrostApp {
 
     /// Poll MOUT?/HTR?/AOUT? for LS350 outputs 1–4 every 30 s.
     fn update_gl7_if_needed(&mut self) {
-        if self.last_gl7_update.elapsed() >= Duration::from_secs(30) {
+        if self.last_gl7_update.elapsed() >= Duration::from_secs(30)
+            && Instant::now() >= self.serial_gate
+        {
+            // 4 outputs × 2 commands × 200 ms → reserve 4 s on the gate
+            self.serial_gate = Instant::now() + Duration::from_secs(4);
             for (i, output_num) in [1u8, 2, 3, 4].iter().enumerate() {
                 self.lakeshore_350.query_output_percentages(*output_num);
                 if self.lakeshore_350.error_message.is_none() {
@@ -888,7 +904,11 @@ impl FrostApp {
 
     /// Update temperature readings every 30 seconds
     fn update_temperatures_if_needed(&mut self) {
-        if self.last_temp_update.elapsed() >= Duration::from_secs(30) {
+        if self.last_temp_update.elapsed() >= Duration::from_secs(30)
+            && Instant::now() >= self.serial_gate
+        {
+            // 7 LS350 + 1 LS370 reads → reserve 5 s on the gate
+            self.serial_gate = Instant::now() + Duration::from_secs(5);
             self.read_all_temperatures();
             self.last_temp_update = Instant::now();
         }
@@ -981,7 +1001,11 @@ impl FrostApp {
 
     /// Poll compressor status every 30 seconds.
     fn update_compressor_status_if_needed(&mut self) {
-        if self.last_compressor_update.elapsed() >= Duration::from_secs(30) {
+        if self.last_compressor_update.elapsed() >= Duration::from_secs(30)
+            && Instant::now() >= self.serial_gate
+        {
+            // ~3 commands × 200 ms each → reserve 3 s on the gate
+            self.serial_gate = Instant::now() + Duration::from_secs(3);
             self.compressor.get_status();
             if let Some(e) = &self.compressor.error_message {
                 self.compressor_status = format!("Error: {}", e);
