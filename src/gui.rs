@@ -5,7 +5,7 @@ use crate::compressor::CryomechController;
 use crate::lakeshore350::LakeShore350Controller;
 use crate::lakeshore370::LakeShore370Controller;
 use crate::lakeshore625::LakeShore625Controller;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
 use std::time::{Duration, Instant};
 
 /// Launch the graphical user interface.
@@ -51,6 +51,23 @@ enum Theme {
     EguiLightBlue,
     EguiLightGreen,
     EguiLightRed,
+}
+
+/// Messages sent from a background GL7 serial thread back to the UI.
+enum Gl7Msg {
+    /// All-outputs background poll completed.
+    Poll {
+        lines: Vec<(String, String)>,
+        mout_values: Vec<f64>,
+    },
+    /// Set + re-poll for one output completed.
+    Set {
+        index: usize,
+        line1: String,
+        line2: String,
+        mout_value: f64,
+        result: Result<(), String>,
+    },
 }
 
 struct FrostApp {
@@ -105,6 +122,17 @@ struct FrostApp {
     magnet_live_current: String,
     magnet_live_voltage: String,
     magnet_live_field: String,
+    // ── GL7 Sorption Cooler ──────────────────────────────────
+    /// First 2 lines of query_output_percentages for outputs 1–4.
+    /// Each entry is (line1, line2) — MOUT% and HTR%/AOUT%.
+    gl7_output_lines: Vec<(String, String)>,
+    last_gl7_update: Instant,
+    /// Editable manual output percentages for outputs 1–4 (0–100).
+    gl7_edit_pct: Vec<f64>,
+    /// Per-output feedback from the last "Set Heater Output" click.
+    gl7_set_msg: Vec<Option<Result<(), String>>>,
+    /// Receiver for background GL7 serial jobs. Some = job in flight.
+    gl7_rx: Option<mpsc::Receiver<Gl7Msg>>,
 }
 
 #[derive(Default)]
@@ -168,6 +196,11 @@ impl Default for FrostApp {
             magnet_live_current: String::new(),
             magnet_live_voltage: String::new(),
             magnet_live_field: String::new(),
+            gl7_output_lines: vec![(String::new(), String::new()); 4],
+            last_gl7_update: Instant::now() - Duration::from_secs(35),
+            gl7_edit_pct: vec![0.0; 4],
+            gl7_set_msg: vec![None, None, None, None],
+            gl7_rx: None,
         }
     }
 }
@@ -246,6 +279,15 @@ impl eframe::App for FrostApp {
             // Magnet / ADR section
             self.update_magnet_limits_if_needed();
             self.show_magnet_section(ui);
+
+            ui.add_space(20.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            // GL7 Sorption Cooler section
+            self.update_gl7_if_needed();
+            if self.gl7_rx.is_some() { ctx.request_repaint_after(Duration::from_millis(50)); }
+            self.show_gl7_section(ui);
 
             ui.add_space(20.0);
             ui.separator();
@@ -732,6 +774,199 @@ impl FrostApp {
         }
     }
 
+    /// Poll MOUT?/HTR?/AOUT? for LS350 outputs 1–4 every 30 s.
+    fn update_gl7_if_needed(&mut self) {
+        // ── Drain any result from the background thread ──────────
+        if let Some(rx) = &self.gl7_rx {
+            match rx.try_recv() {
+                Ok(Gl7Msg::Poll { lines, mout_values }) => {
+                    for (i, pair) in lines.into_iter().enumerate() {
+                        self.gl7_output_lines[i] = pair;
+                        self.gl7_edit_pct[i] = mout_values[i];
+                    }
+                    self.last_gl7_update = Instant::now();
+                    self.gl7_rx = None;
+                }
+                Ok(Gl7Msg::Set { index, line1, line2, mout_value, result }) => {
+                    self.gl7_output_lines[index] = (line1, line2);
+                    self.gl7_edit_pct[index] = mout_value;
+                    self.gl7_set_msg[index] = Some(result);
+                    self.gl7_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {} // thread still running
+                Err(mpsc::TryRecvError::Disconnected) => { self.gl7_rx = None; }
+            }
+        }
+
+        // ── Kick off a background poll if idle and interval elapsed ─
+        if self.gl7_rx.is_none() && self.last_gl7_update.elapsed() >= Duration::from_secs(30) {
+            let (tx, rx) = mpsc::channel();
+            self.gl7_rx = Some(rx);
+            let port = self.lakeshore_350.port.clone();
+            let baud = self.lakeshore_350.baud_rate;
+            std::thread::spawn(move || {
+                let mut lines = vec![(String::new(), String::new()); 4];
+                let mut mout_values = vec![0.0f64; 4];
+                for (i, out_num) in [1u8, 2, 3, 4].iter().enumerate() {
+                    let mout_res = ls350_send_command(&port, baud, &format!("MOUT? {out_num}"));
+                    let htr_res  = if *out_num <= 2 {
+                        ls350_send_command(&port, baud, &format!("HTR? {out_num}"))
+                    } else {
+                        ls350_send_command(&port, baud, &format!("AOUT? {out_num}"))
+                    };
+                    let l1 = match &mout_res {
+                        Ok(r)  => format!("MOUT (Manual Output %) {out_num}: {r}"),
+                        Err(e) => format!("MOUT? {out_num}: ERROR ({e})"),
+                    };
+                    let l2 = match (&htr_res, *out_num <= 2) {
+                        (Ok(r), true)  => format!("HTR (Heater Output %) {out_num}: {r}"),
+                        (Ok(r), false) => format!("AOUT (Analog Output %) {out_num}: {r}"),
+                        (Err(e), true)  => format!("HTR? {out_num}: ERROR ({e})"),
+                        (Err(e), false) => format!("AOUT? {out_num}: ERROR ({e})"),
+                    };
+                    if let Ok(v) = mout_res.as_ref().map(|r| r.trim().parse::<f64>()) {
+                        if let Ok(v) = v { mout_values[i] = v; }
+                    }
+                    lines[i] = (l1, l2);
+                }
+                let _ = tx.send(Gl7Msg::Poll { lines, mout_values });
+            });
+        }
+    }
+
+    /// Draw the GL7 Sorption Cooler section.
+    fn show_gl7_section(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("GL7 Sorption Cooler")
+                    .size(32.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(40, 40, 140)),
+            )
+            .selectable(false),
+        );
+        ui.add_space(6.0);
+
+        let lines = self.gl7_output_lines.clone();
+        let output_names = ["4-Pump Heater", "3-Pump Heater", "4-Switch Heater", "3-Switch Heater"];
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for (i, (l1, l2)) in lines.iter().enumerate() {
+                let output_num = i + 1;
+                let label = output_names[i];
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(255, 243, 220))
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(180, 130, 50)))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.set_min_width(220.0);
+                        ui.vertical(|ui| {
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(label)
+                                    .strong()
+                                    .size(14.0),
+                            ).selectable(false));
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(format!("LS350 · Output {output_num}"))
+                                    .size(10.5)
+                                    .color(egui::Color32::from_gray(110)),
+                            ).selectable(false));
+                            ui.add_space(4.0);
+                            if l1.is_empty() {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new("(pending…)")
+                                        .size(12.0)
+                                        .monospace()
+                                        .color(egui::Color32::from_gray(150)),
+                                ).selectable(false));
+                            } else {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(l1.as_str()).size(12.0).monospace(),
+                                ).selectable(false));
+                                if !l2.is_empty() {
+                                    ui.add(egui::Label::new(
+                                        egui::RichText::new(l2.as_str()).size(12.0).monospace(),
+                                    ).selectable(false));
+                                }
+                            }
+                            ui.add_space(6.0);
+                            // ── Set output control ───────────────────────
+                            let busy = self.gl7_rx.is_some();
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.gl7_edit_pct[i])
+                                        .speed(0.5)
+                                        .clamp_range(0.0_f64..=100.0_f64)
+                                        .fixed_decimals(1)
+                                        .suffix(" %"),
+                                );
+                                let set_btn = egui::Button::new(
+                                    egui::RichText::new("Set").strong()
+                                )
+                                .fill(egui::Color32::from_rgb(80, 120, 60));
+                                if ui.add_enabled(!busy, set_btn).clicked() {
+                                    let pct = self.gl7_edit_pct[i];
+                                    let idx = i;
+                                    let out_num = (i + 1) as u8;
+                                    let port = self.lakeshore_350.port.clone();
+                                    let baud = self.lakeshore_350.baud_rate;
+                                    self.gl7_set_msg[i] = None; // clear old feedback
+                                    let (tx, rx) = mpsc::channel();
+                                    self.gl7_rx = Some(rx);
+                                    std::thread::spawn(move || {
+                                        let set_result = ls350_send_write_command(&port, baud, &format!("MOUT {out_num},{pct}"));
+                                        let mout_res = ls350_send_command(&port, baud, &format!("MOUT? {out_num}"));
+                                        let htr_res  = if out_num <= 2 {
+                                            ls350_send_command(&port, baud, &format!("HTR? {out_num}"))
+                                        } else {
+                                            ls350_send_command(&port, baud, &format!("AOUT? {out_num}"))
+                                        };
+                                        let l1 = match &mout_res {
+                                            Ok(r)  => format!("MOUT (Manual Output %) {out_num}: {r}"),
+                                            Err(e) => format!("MOUT? {out_num}: ERROR ({e})"),
+                                        };
+                                        let l2 = match (&htr_res, out_num <= 2) {
+                                            (Ok(r), true)  => format!("HTR (Heater Output %) {out_num}: {r}"),
+                                            (Ok(r), false) => format!("AOUT (Analog Output %) {out_num}: {r}"),
+                                            (Err(e), true)  => format!("HTR? {out_num}: ERROR ({e})"),
+                                            (Err(e), false) => format!("AOUT? {out_num}: ERROR ({e})"),
+                                        };
+                                        let mout_value = mout_res.as_ref().ok()
+                                            .and_then(|r| r.trim().parse::<f64>().ok())
+                                            .unwrap_or(pct);
+                                        let _ = tx.send(Gl7Msg::Set {
+                                            index: idx,
+                                            line1: l1,
+                                            line2: l2,
+                                            mout_value,
+                                            result: set_result,
+                                        });
+                                    });
+                                }
+                                if busy { ui.add(egui::Spinner::new()); }
+                            });
+                            if !busy {
+                                if let Some(ref msg) = self.gl7_set_msg[i].clone() {
+                                    match msg {
+                                        Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Set."); }
+                                        Err(e)  => { ui.colored_label(egui::Color32::RED, e.as_str()); }
+                                    }
+                                }
+                            }
+                        });
+                    });
+            }
+        });
+
+        ui.add_space(4.0);
+        ui.label(format!(
+            "Last updated: {:.1}s ago  (refreshes every 30 s)",
+            self.last_gl7_update.elapsed().as_secs_f32()
+        ));
+    }
+
     /// Update temperature readings every 30 seconds
     fn update_temperatures_if_needed(&mut self) {
         if self.last_temp_update.elapsed() >= Duration::from_secs(30) {
@@ -1084,6 +1319,56 @@ fn parse_single_value(output: &str) -> Option<f64> {
 /// Parse the formatted output of `get_limits()` into (current, voltage, rate).
 /// Expected format:
 ///   "Current limit: X A\nVoltage limit: Y V\nRate limit:    Z A/s"
+// ── LS350 background serial helpers ─────────────────────────
+// Free functions (no controller struct) so they can run in spawned threads.
+
+/// Open LS350 port, send command, read one response line.
+fn ls350_send_command(port: &str, baud: u32, command: &str) -> Result<String, String> {
+    use serialport::{DataBits, Parity, StopBits};
+    use std::io::{Read, Write};
+    let mut p = serialport::new(port, baud)
+        .data_bits(DataBits::Seven)
+        .parity(Parity::Odd)
+        .stop_bits(StopBits::One)
+        .timeout(Duration::from_millis(2000))
+        .open()
+        .map_err(|e| format!("Failed to open {port}: {e}"))?;
+    p.clear(serialport::ClearBuffer::Input).ok();
+    p.write_all(format!("{command}\n").as_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    std::thread::sleep(Duration::from_millis(300));
+    let mut response = String::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match p.read(&mut byte) {
+            Ok(1) => {
+                let c = byte[0] as char;
+                if c == '\n' { break; } else if c != '\r' { response.push(c); }
+            }
+            _ => break,
+        }
+    }
+    Ok(response.trim().to_string())
+}
+
+/// Open LS350 port, send a write-only command (no response expected).
+fn ls350_send_write_command(port: &str, baud: u32, command: &str) -> Result<(), String> {
+    use serialport::{DataBits, Parity, StopBits};
+    use std::io::Write;
+    let mut p = serialport::new(port, baud)
+        .data_bits(DataBits::Seven)
+        .parity(Parity::Odd)
+        .stop_bits(StopBits::One)
+        .timeout(Duration::from_millis(2000))
+        .open()
+        .map_err(|e| format!("Failed to open {port}: {e}"))?;
+    p.clear(serialport::ClearBuffer::Input).ok();
+    p.write_all(format!("{command}\n").as_bytes())
+        .map_err(|e| format!("Write error: {e}"))?;
+    std::thread::sleep(Duration::from_millis(200));
+    Ok(())
+}
+
 fn parse_limits_from_output(output: &str) -> Option<(f64, f64, f64)> {
     let mut current = None;
     let mut voltage = None;

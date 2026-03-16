@@ -1147,6 +1147,34 @@ impl LakeShore350Controller {
         }
     }
 
+    /// Quick poll: fetch only `MOUT?` and `HTR?`/`AOUT?` for one output.
+    /// Used by the GUI GL7 status cards to avoid the full multi-query overhead.
+    pub fn query_output_percentages(&mut self, output_num: u8) {
+        if let Err(e) = Self::validate_output(output_num) {
+            self.error_message = Some(e);
+            return;
+        }
+        let mut out = String::new();
+        let mut last_err: Option<String> = None;
+        match self.send_command(&format!("MOUT? {output_num}")) {
+            Ok(r) => out.push_str(&format!("MOUT (Manual Output %) {output_num}: {r}\n")),
+            Err(e) => { out.push_str(&format!("MOUT? {output_num}: ERROR ({e})\n")); last_err = Some(e); }
+        }
+        if output_num <= 2 {
+            match self.send_command(&format!("HTR? {output_num}")) {
+                Ok(r) => out.push_str(&format!("HTR (Heater Output %) {output_num}: {r}\n")),
+                Err(e) => { out.push_str(&format!("HTR? {output_num}: ERROR ({e})\n")); last_err = Some(e); }
+            }
+        } else {
+            match self.send_command(&format!("AOUT? {output_num}")) {
+                Ok(r) => out.push_str(&format!("AOUT (Analog Output %) {output_num}: {r}\n")),
+                Err(e) => { out.push_str(&format!("AOUT? {output_num}: ERROR ({e})\n")); last_err = Some(e); }
+            }
+        }
+        self.output = out;
+        self.error_message = last_err;
+    }
+
     /// Query output status using MOUT, OUTMODE, HTRSET/HTR, AOUT/ANALOG, RANGE.
     /// Mirrors `query_outputs()` in outputs.py.
     pub fn query_output(&mut self, output_num: u8) {
