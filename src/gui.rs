@@ -5,7 +5,7 @@ use crate::compressor::CryomechController;
 use crate::lakeshore350::LakeShore350Controller;
 use crate::lakeshore370::LakeShore370Controller;
 use crate::lakeshore625::LakeShore625Controller;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 /// Launch the graphical user interface.
@@ -51,23 +51,6 @@ enum Theme {
     EguiLightBlue,
     EguiLightGreen,
     EguiLightRed,
-}
-
-/// Messages sent from a background GL7 serial thread back to the UI.
-enum Gl7Msg {
-    /// All-outputs background poll completed.
-    Poll {
-        lines: Vec<(String, String)>,
-        mout_values: Vec<f64>,
-    },
-    /// Set + re-poll for one output completed.
-    Set {
-        index: usize,
-        line1: String,
-        line2: String,
-        mout_value: f64,
-        result: Result<(), String>,
-    },
 }
 
 struct FrostApp {
@@ -131,8 +114,6 @@ struct FrostApp {
     gl7_edit_pct: Vec<f64>,
     /// Per-output feedback from the last "Set Heater Output" click.
     gl7_set_msg: Vec<Option<Result<(), String>>>,
-    /// Receiver for background GL7 serial jobs. Some = job in flight.
-    gl7_rx: Option<mpsc::Receiver<Gl7Msg>>,
 }
 
 #[derive(Default)]
@@ -200,7 +181,6 @@ impl Default for FrostApp {
             last_gl7_update: Instant::now() - Duration::from_secs(35),
             gl7_edit_pct: vec![0.0; 4],
             gl7_set_msg: vec![None, None, None, None],
-            gl7_rx: None,
         }
     }
 }
@@ -286,7 +266,6 @@ impl eframe::App for FrostApp {
 
             // GL7 Sorption Cooler section
             self.update_gl7_if_needed();
-            if self.gl7_rx.is_some() { ctx.request_repaint_after(Duration::from_millis(50)); }
             self.show_gl7_section(ui);
 
             ui.add_space(20.0);
@@ -776,61 +755,21 @@ impl FrostApp {
 
     /// Poll MOUT?/HTR?/AOUT? for LS350 outputs 1–4 every 30 s.
     fn update_gl7_if_needed(&mut self) {
-        // ── Drain any result from the background thread ──────────
-        if let Some(rx) = &self.gl7_rx {
-            match rx.try_recv() {
-                Ok(Gl7Msg::Poll { lines, mout_values }) => {
-                    for (i, pair) in lines.into_iter().enumerate() {
-                        self.gl7_output_lines[i] = pair;
-                        self.gl7_edit_pct[i] = mout_values[i];
+        if self.last_gl7_update.elapsed() >= Duration::from_secs(30) {
+            for (i, output_num) in [1u8, 2, 3, 4].iter().enumerate() {
+                self.lakeshore_350.query_output_percentages(*output_num);
+                if self.lakeshore_350.error_message.is_none() {
+                    let mut lines = self.lakeshore_350.output.lines();
+                    let l1 = lines.next().unwrap_or("").to_string();
+                    let l2 = lines.next().unwrap_or("").to_string();
+                    // Parse current MOUT% from the first line: "MOUT (Manual Output %) N: <val>"
+                    if let Some(val) = l1.split_whitespace().last().and_then(|s| s.parse::<f64>().ok()) {
+                        self.gl7_edit_pct[i] = val;
                     }
-                    self.last_gl7_update = Instant::now();
-                    self.gl7_rx = None;
+                    self.gl7_output_lines[i] = (l1, l2);
                 }
-                Ok(Gl7Msg::Set { index, line1, line2, mout_value, result }) => {
-                    self.gl7_output_lines[index] = (line1, line2);
-                    self.gl7_edit_pct[index] = mout_value;
-                    self.gl7_set_msg[index] = Some(result);
-                    self.gl7_rx = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {} // thread still running
-                Err(mpsc::TryRecvError::Disconnected) => { self.gl7_rx = None; }
             }
-        }
-
-        // ── Kick off a background poll if idle and interval elapsed ─
-        if self.gl7_rx.is_none() && self.last_gl7_update.elapsed() >= Duration::from_secs(30) {
-            let (tx, rx) = mpsc::channel();
-            self.gl7_rx = Some(rx);
-            let port = self.lakeshore_350.port.clone();
-            let baud = self.lakeshore_350.baud_rate;
-            std::thread::spawn(move || {
-                let mut lines = vec![(String::new(), String::new()); 4];
-                let mut mout_values = vec![0.0f64; 4];
-                for (i, out_num) in [1u8, 2, 3, 4].iter().enumerate() {
-                    let mout_res = ls350_send_command(&port, baud, &format!("MOUT? {out_num}"));
-                    let htr_res  = if *out_num <= 2 {
-                        ls350_send_command(&port, baud, &format!("HTR? {out_num}"))
-                    } else {
-                        ls350_send_command(&port, baud, &format!("AOUT? {out_num}"))
-                    };
-                    let l1 = match &mout_res {
-                        Ok(r)  => format!("MOUT (Manual Output %) {out_num}: {r}"),
-                        Err(e) => format!("MOUT? {out_num}: ERROR ({e})"),
-                    };
-                    let l2 = match (&htr_res, *out_num <= 2) {
-                        (Ok(r), true)  => format!("HTR (Heater Output %) {out_num}: {r}"),
-                        (Ok(r), false) => format!("AOUT (Analog Output %) {out_num}: {r}"),
-                        (Err(e), true)  => format!("HTR? {out_num}: ERROR ({e})"),
-                        (Err(e), false) => format!("AOUT? {out_num}: ERROR ({e})"),
-                    };
-                    if let Ok(v) = mout_res.as_ref().map(|r| r.trim().parse::<f64>()) {
-                        if let Ok(v) = v { mout_values[i] = v; }
-                    }
-                    lines[i] = (l1, l2);
-                }
-                let _ = tx.send(Gl7Msg::Poll { lines, mout_values });
-            });
+            self.last_gl7_update = Instant::now();
         }
     }
 
@@ -893,7 +832,6 @@ impl FrostApp {
                             }
                             ui.add_space(6.0);
                             // ── Set output control ───────────────────────
-                            let busy = self.gl7_rx.is_some();
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::DragValue::new(&mut self.gl7_edit_pct[i])
@@ -906,53 +844,34 @@ impl FrostApp {
                                     egui::RichText::new("Set").strong()
                                 )
                                 .fill(egui::Color32::from_rgb(80, 120, 60));
-                                if ui.add_enabled(!busy, set_btn).clicked() {
+                                if ui.add(set_btn).clicked() {
                                     let pct = self.gl7_edit_pct[i];
-                                    let idx = i;
-                                    let out_num = (i + 1) as u8;
-                                    let port = self.lakeshore_350.port.clone();
-                                    let baud = self.lakeshore_350.baud_rate;
-                                    self.gl7_set_msg[i] = None; // clear old feedback
-                                    let (tx, rx) = mpsc::channel();
-                                    self.gl7_rx = Some(rx);
-                                    std::thread::spawn(move || {
-                                        let set_result = ls350_send_write_command(&port, baud, &format!("MOUT {out_num},{pct}"));
-                                        let mout_res = ls350_send_command(&port, baud, &format!("MOUT? {out_num}"));
-                                        let htr_res  = if out_num <= 2 {
-                                            ls350_send_command(&port, baud, &format!("HTR? {out_num}"))
-                                        } else {
-                                            ls350_send_command(&port, baud, &format!("AOUT? {out_num}"))
-                                        };
-                                        let l1 = match &mout_res {
-                                            Ok(r)  => format!("MOUT (Manual Output %) {out_num}: {r}"),
-                                            Err(e) => format!("MOUT? {out_num}: ERROR ({e})"),
-                                        };
-                                        let l2 = match (&htr_res, out_num <= 2) {
-                                            (Ok(r), true)  => format!("HTR (Heater Output %) {out_num}: {r}"),
-                                            (Ok(r), false) => format!("AOUT (Analog Output %) {out_num}: {r}"),
-                                            (Err(e), true)  => format!("HTR? {out_num}: ERROR ({e})"),
-                                            (Err(e), false) => format!("AOUT? {out_num}: ERROR ({e})"),
-                                        };
-                                        let mout_value = mout_res.as_ref().ok()
-                                            .and_then(|r| r.trim().parse::<f64>().ok())
-                                            .unwrap_or(pct);
-                                        let _ = tx.send(Gl7Msg::Set {
-                                            index: idx,
-                                            line1: l1,
-                                            line2: l2,
-                                            mout_value,
-                                            result: set_result,
-                                        });
-                                    });
-                                }
-                                if busy { ui.add(egui::Spinner::new()); }
-                            });
-                            if !busy {
-                                if let Some(ref msg) = self.gl7_set_msg[i].clone() {
-                                    match msg {
-                                        Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Set."); }
-                                        Err(e)  => { ui.colored_label(egui::Color32::RED, e.as_str()); }
+                                    let out_num = output_num as u8;
+                                    self.lakeshore_350.set_output_percent(out_num, pct);
+                                    if self.lakeshore_350.error_message.is_some() {
+                                        self.gl7_set_msg[i] = Some(Err(
+                                            self.lakeshore_350.error_message.clone().unwrap()
+                                        ));
+                                    } else {
+                                        // Refresh this output's display
+                                        self.lakeshore_350.query_output_percentages(out_num);
+                                        if self.lakeshore_350.error_message.is_none() {
+                                            let mut ls = self.lakeshore_350.output.lines();
+                                            let nl1 = ls.next().unwrap_or("").to_string();
+                                            let nl2 = ls.next().unwrap_or("").to_string();
+                                            if let Some(v) = nl1.split_whitespace().last().and_then(|s| s.parse::<f64>().ok()) {
+                                                self.gl7_edit_pct[i] = v;
+                                            }
+                                            self.gl7_output_lines[i] = (nl1, nl2);
+                                        }
+                                        self.gl7_set_msg[i] = Some(Ok(()));
                                     }
+                                }
+                            });
+                            if let Some(ref msg) = self.gl7_set_msg[i].clone() {
+                                match msg {
+                                    Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Set."); }
+                                    Err(e)  => { ui.colored_label(egui::Color32::RED, e.as_str()); }
                                 }
                             }
                         });
@@ -1319,56 +1238,6 @@ fn parse_single_value(output: &str) -> Option<f64> {
 /// Parse the formatted output of `get_limits()` into (current, voltage, rate).
 /// Expected format:
 ///   "Current limit: X A\nVoltage limit: Y V\nRate limit:    Z A/s"
-// ── LS350 background serial helpers ─────────────────────────
-// Free functions (no controller struct) so they can run in spawned threads.
-
-/// Open LS350 port, send command, read one response line.
-fn ls350_send_command(port: &str, baud: u32, command: &str) -> Result<String, String> {
-    use serialport::{DataBits, Parity, StopBits};
-    use std::io::{Read, Write};
-    let mut p = serialport::new(port, baud)
-        .data_bits(DataBits::Seven)
-        .parity(Parity::Odd)
-        .stop_bits(StopBits::One)
-        .timeout(Duration::from_millis(2000))
-        .open()
-        .map_err(|e| format!("Failed to open {port}: {e}"))?;
-    p.clear(serialport::ClearBuffer::Input).ok();
-    p.write_all(format!("{command}\n").as_bytes())
-        .map_err(|e| format!("Write error: {e}"))?;
-    std::thread::sleep(Duration::from_millis(300));
-    let mut response = String::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match p.read(&mut byte) {
-            Ok(1) => {
-                let c = byte[0] as char;
-                if c == '\n' { break; } else if c != '\r' { response.push(c); }
-            }
-            _ => break,
-        }
-    }
-    Ok(response.trim().to_string())
-}
-
-/// Open LS350 port, send a write-only command (no response expected).
-fn ls350_send_write_command(port: &str, baud: u32, command: &str) -> Result<(), String> {
-    use serialport::{DataBits, Parity, StopBits};
-    use std::io::Write;
-    let mut p = serialport::new(port, baud)
-        .data_bits(DataBits::Seven)
-        .parity(Parity::Odd)
-        .stop_bits(StopBits::One)
-        .timeout(Duration::from_millis(2000))
-        .open()
-        .map_err(|e| format!("Failed to open {port}: {e}"))?;
-    p.clear(serialport::ClearBuffer::Input).ok();
-    p.write_all(format!("{command}\n").as_bytes())
-        .map_err(|e| format!("Write error: {e}"))?;
-    std::thread::sleep(Duration::from_millis(200));
-    Ok(())
-}
-
 fn parse_limits_from_output(output: &str) -> Option<(f64, f64, f64)> {
     let mut current = None;
     let mut voltage = None;
