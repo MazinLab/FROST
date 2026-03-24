@@ -254,15 +254,23 @@ impl HeatswitchController {
     /// Open: CW 115200 steps (command sent, returns immediately).
     pub fn open(&mut self) -> Result<(), String> {
         let mut drv = self.connect()?;
-        drv.move_relative(HEATSWITCH_TRAVEL_STEPS)
-            .map_err(|e| e.to_string())
+        match drv.move_relative(HEATSWITCH_TRAVEL_STEPS) {
+            Ok(()) => Ok(()),
+            // Motor executes the command but sometimes doesn't send a timely
+            // acknowledgement — treat a read timeout as success.
+            Err(ZaberError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     /// Close: CCW 115200 steps (command sent, returns immediately).
     pub fn close(&mut self) -> Result<(), String> {
         let mut drv = self.connect()?;
-        drv.move_relative(-HEATSWITCH_TRAVEL_STEPS)
-            .map_err(|e| e.to_string())
+        match drv.move_relative(-HEATSWITCH_TRAVEL_STEPS) {
+            Ok(()) => Ok(()),
+            Err(ZaberError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     // ── Motion ───────────────────────────────────────────────
