@@ -8,8 +8,12 @@
 // Command terminator: \r\n
 // Response terminator: \n
 
+use chrono::Local;
 use serialport::{DataBits, Parity, StopBits};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 // ── Default connection settings ──────────────────────────────
@@ -361,6 +365,118 @@ impl LakeShore625Controller {
             Err(e) => self.error_message = Some(e),
         }
     }
+
+    // ── Ramp data logging ───────────────────────────────────────
+
+    /// Return the path that the next `run_logging` call will write to.
+    /// Creates the `ramps/` directory if needed.
+    pub fn next_log_path() -> String {
+        const OUTPUT_DIR: &str = "ramps";
+        std::fs::create_dir_all(OUTPUT_DIR).ok();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        next_ramp_csv(OUTPUT_DIR, &date)
+    }
+
+    /// Core logging loop — one row per minute.
+    ///
+    /// * `stop`    — set to `true` to end the loop cleanly (checked every 100 ms).
+    /// * `verbose` — if `true`, prints the formatted table to stdout;
+    ///               if `false`, writes to CSV only (suitable for background use).
+    pub fn run_logging_until(&self, stop: Arc<AtomicBool>, verbose: bool) -> Result<(), String> {
+        const OUTPUT_DIR:    &str = "ramps";
+        const INTERVAL_SECS: u64 = 60;
+
+        std::fs::create_dir_all(OUTPUT_DIR)
+            .map_err(|e| format!("Cannot create '{}' directory: {e}", OUTPUT_DIR))?;
+
+        let date_str = Local::now().format("%Y-%m-%d").to_string();
+        let csv_path = next_ramp_csv(OUTPUT_DIR, &date_str);
+
+        if verbose {
+            println!("Starting LakeShore 625 ramp data logging...");
+            println!("Recording interval: {} seconds", INTERVAL_SECS);
+            println!("CSV file will be saved as: {}", csv_path);
+            println!("Press Ctrl+C to stop recording and save data");
+            println!("{}", "-".repeat(120));
+            println!();
+            print_ramp_header();
+        }
+
+        // Create the CSV file with a formatted header row immediately.
+        {
+            let header_line = ramp_format_row(
+                &RAMP_HEADERS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            let mut f = OpenOptions::new()
+                .create(true).write(true).truncate(true)
+                .open(&csv_path)
+                .map_err(|e| format!("Cannot create '{}': {e}", csv_path))?;
+            writeln!(f, "{}", header_line)
+                .map_err(|e| format!("Write error: {e}"))?;
+        }
+
+        let start = std::time::Instant::now();
+
+        while !stop.load(Ordering::Relaxed) {
+            let now   = Local::now();
+            let ts    = now.format("%Y-%m-%dT%H:%M:%S%.6f").to_string();
+            let date  = now.format("%Y-%m-%d").to_string();
+            let time  = now.format("%H:%M:%S").to_string();
+            let elap  = start.elapsed().as_secs_f64();
+
+            let rate  = self.read_f64("RATE?");
+            let cur   = self.read_f64("RDGI?");
+            let volt  = self.read_f64("RDGV?");
+            let field = self.read_f64("RDGF?");
+            let err   = self.read_error_compact();
+
+            let row = vec![
+                ts,
+                date,
+                time,
+                fmt_ramp_f64_opt(Some(elap), 1),
+                fmt_ramp_f64_opt(rate,  4),
+                fmt_ramp_f64_opt(cur,   4),
+                fmt_ramp_f64_opt(volt,  4),
+                fmt_ramp_f64_opt(field, 4),
+                err,
+            ];
+
+            if verbose { print_ramp_row(&row); }
+
+            if let Err(e) = append_ramp_row(&csv_path, &ramp_format_row(&row)) {
+                eprintln!("Warning: could not write row: {e}");
+            }
+
+            // Sleep in 100 ms ticks so the stop flag is noticed promptly.
+            for _ in 0..(INTERVAL_SECS * 10) {
+                if stop.load(Ordering::Relaxed) { break; }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        Ok(())
+    }
+
+    /// Continuously log ramp data to a date-stamped CSV in `ramps/`.
+    /// Prints a live formatted table to stdout.  Runs until Ctrl+C.
+    pub fn run_logging(&self) -> Result<(), String> {
+        self.run_logging_until(Arc::new(AtomicBool::new(false)), true)
+    }
+
+    /// Parse a raw SCPI response to `f64`, stripping a leading `+`.
+    fn read_f64(&self, cmd: &str) -> Option<f64> {
+        self.send_command(cmd).ok()
+            .filter(|r| !r.is_empty())
+            .and_then(|r| r.trim_start_matches('+').parse::<f64>().ok())
+    }
+
+    /// `ERSTR?` — compact semicolon-separated error string (or "None").
+    fn read_error_compact(&self) -> String {
+        match self.send_command("ERSTR?") {
+            Ok(r) if !r.is_empty() => parse_error_compact(&r),
+            _ => "None".to_string(),
+        }
+    }
 }
 
 // ── ERSTR? bit-field parser ───────────────────────────────────
@@ -415,4 +531,100 @@ fn parse_error_status(response: &str) -> String {
     }
 
     out
+}
+
+// ── Ramp logging support ──────────────────────────────────────────
+// Column headers and widths mirror logging.py from lakeshore625-python.
+const RAMP_HEADERS: &[&str] = &[
+    "Timestamp", "Date", "Time", "Elapsed_Seconds",
+    "Ramp_Rate_A_per_s", "Current_A", "Voltage_V", "Field_T", "Error_Status",
+];
+const RAMP_WIDTHS: &[usize] = &[28, 12, 12, 16, 18, 14, 14, 14, 20];
+
+/// Find the next available ramp log path (auto-increments `_1`, `_2`, …).
+fn next_ramp_csv(dir: &str, date: &str) -> String {
+    let base = format!("{}/{}_ramp_log.csv", dir, date);
+    if !Path::new(&base).exists() { return base; }
+    let mut n = 1u32;
+    loop {
+        let p = format!("{}/{}_ramp_log_{}.csv", dir, date, n);
+        if !Path::new(&p).exists() { return p; }
+        n += 1;
+    }
+}
+
+/// Print fixed-width header + separator dashes to stdout.
+fn print_ramp_header() {
+    let line: String = RAMP_HEADERS.iter().zip(RAMP_WIDTHS.iter())
+        .map(|(h, w)| format!("{:<width$}", h, width = w))
+        .collect();
+    println!("{}", line);
+    let sep: String = RAMP_WIDTHS.iter().map(|w| "-".repeat(*w)).collect();
+    println!("{}", sep);
+}
+
+/// Print one data row to stdout (every column padded to its width).
+fn print_ramp_row(values: &[String]) {
+    let line: String = values.iter().enumerate()
+        .map(|(i, v)| format!("{:<width$}", v, width = RAMP_WIDTHS.get(i).copied().unwrap_or(0)))
+        .collect();
+    println!("{}", line);
+}
+
+/// Format an `Option<f64>` as `decimals`-place string, or `"NO_RESPONSE"`.
+fn fmt_ramp_f64_opt(v: Option<f64>, decimals: usize) -> String {
+    match v {
+        Some(x) => format!("{:.prec$}", x, prec = decimals),
+        None    => "NO_RESPONSE".to_string(),
+    }
+}
+
+/// Serialize a row to a fixed-width string for the CSV.
+/// All columns are padded except the last — mirrors `append_to_formatted_csv` in logging.py.
+fn ramp_format_row(values: &[String]) -> String {
+    let last = values.len().saturating_sub(1);
+    values.iter().enumerate()
+        .map(|(i, v)| {
+            if i == last {
+                v.clone()
+            } else {
+                format!("{:<width$}", v, width = RAMP_WIDTHS.get(i).copied().unwrap_or(0))
+            }
+        })
+        .collect()
+}
+
+/// Append one formatted line to the CSV file.
+fn append_ramp_row(path: &str, line: &str) -> Result<(), String> {
+    let mut f = OpenOptions::new()
+        .append(true).open(path)
+        .map_err(|e| format!("Cannot open '{}': {e}", path))?;
+    writeln!(f, "{}", line).map_err(|e| format!("Write error: {e}"))
+}
+
+/// Parse `ERSTR?` response into a compact semicolon-separated error string.
+/// Mirrors `_parse_error_status` in logging.py.
+fn parse_error_compact(response: &str) -> String {
+    let parts: Vec<&str> = response.splitn(3, ',').collect();
+    if parts.len() != 3 { return "Parse Error".to_string(); }
+    let hw  = parts[0].trim().parse::<u32>().unwrap_or(0);
+    let op  = parts[1].trim().parse::<u32>().unwrap_or(0);
+    let psh = parts[2].trim().parse::<u32>().unwrap_or(0);
+    let mut errors: Vec<&str> = Vec::new();
+    if op  & 64 != 0 { errors.push("Magnet Crowbar"); }
+    if op  & 32 != 0 { errors.push("Magnet Quench"); }
+    if op  & 16 != 0 { errors.push("Remote Inhibit"); }
+    if op  &  8 != 0 { errors.push("Temp High"); }
+    if op  &  4 != 0 { errors.push("High Line Voltage"); }
+    if op  &  2 != 0 { errors.push("Ext Program Error"); }
+    if op  &  1 != 0 { errors.push("Calibration Error"); }
+    if hw  & 32 != 0 { errors.push("DAC Error"); }
+    if hw  & 16 != 0 { errors.push("Output Control Fail"); }
+    if hw  &  8 != 0 { errors.push("Output Over Voltage"); }
+    if hw  &  4 != 0 { errors.push("Output Over Current"); }
+    if hw  &  2 != 0 { errors.push("Low Line Voltage"); }
+    if hw  &  1 != 0 { errors.push("Temperature Fault"); }
+    if psh &  2 != 0 { errors.push("PSH Short"); }
+    if psh &  1 != 0 { errors.push("PSH Open"); }
+    if errors.is_empty() { "None".to_string() } else { errors.join("; ") }
 }
