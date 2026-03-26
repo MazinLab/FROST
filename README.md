@@ -10,9 +10,9 @@ FROST provides a single interface for controlling and monitoring all cryostat ha
 |--------|------|
 | **Lakeshore 625** | Superconducting Magnet Power Supply — ramps/de-ramps ADR magnet |
 | **Lakeshore 370** | AC Resistance Bridge — monitors device stage temperature, controls PID loop with LS625 |
-| **Lakeshore 350** | Temperature Controller — all stage and GL7 thermometers, GL7 heater outputs |
+| **Lakeshore 350** | Temperature Controller — all stage and GL7 thermometers, GL7 heater and switch outputs |
 | **Heatswitch** | Zaber T-NM17A04 stepper motor — opens/closes heat switch during ADR ramp |
-| **Compressor** | Cryomech pulse tube compressor — turns PT cooling on/off during cooldown |
+| **Compressor** | Cryomech compressor — turns PT cooling on/off during cooldown |
 
 ---
 
@@ -23,6 +23,24 @@ FROST provides a single interface for controlling and monitoring all cryostat ha
 - `cryomech_api` crate at `../cryomech_api/` (path dependency — see [Dependencies](#dependencies))
 
 ---
+
+## Installation
+
+After building, the binary lives at `target/release/frost`. The recommended installation is a symlink — it survives rebuilds without any extra steps:
+
+```bash
+sudo ln -sf $(pwd)/target/release/frost /usr/local/bin/frost
+```
+
+Only needs to be run once. Every subsequent `cargo build --release` automatically updates the installed binary. This enables the user to use FROST functionality from any directory without being inside the project directory. 
+
+Verify the installation:
+```bash
+frost --help
+```
+
+---
+
 
 ## Building
 
@@ -39,22 +57,6 @@ cargo test -- --include-ignored
 
 ---
 
-## Installation
-
-After building, the binary lives at `target/release/frost`. The recommended installation is a symlink — it survives rebuilds without any extra steps:
-
-```bash
-sudo ln -sf $(pwd)/target/release/frost /usr/local/bin/frost
-```
-
-Only needs to be run once. Every subsequent `cargo build --release` automatically updates the installed binary.
-
-Verify the installation:
-```bash
-frost --help
-```
-
----
 
 ## Serial Port Configuration
 
@@ -96,7 +98,7 @@ The GUI runs a background worker thread that polls all devices every 30 seconds 
 **Compressor**
 - Start/Stop buttons with live status display
 - Shows running state and last update time
-- Compressor intent is persisted to disk (`state/.compressor_intent`) — if FROST is restarted, the GUI restores the last known compressor state
+- Compressor intent is persisted to disk (`state/.compressor_intent`) — if FROST CLI or GUI is restarted, the GUI restores the last known compressor state
 
 **Magnet (Lakeshore 625)**
 - Live readouts: current (A), voltage (V), field
@@ -299,6 +301,7 @@ frost record-temps [--port-350 PORT] [--port-370 PORT] <command>
 frost record-temps snapshot
 
 # Log continuously at 30-second intervals (Ctrl+C to stop)
+# Note that loop will continuously print out in the terminal and Ctrl+C will end the recording and truncate the .csv. It is recommended to run this command in a tmux pane
 frost record-temps loop
 
 # Log at a custom interval (seconds)
