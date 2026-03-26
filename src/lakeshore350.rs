@@ -19,9 +19,6 @@
 //   Input D5 — 4-pump diode (voltage → temperature via pumps_calibration)
 //   Channels 1–8 — mirrors of Input A (not used by FROST)
 
-use serialport::{DataBits, Parity, StopBits};
-use std::io::{Read, Write};
-use std::time::Duration;
 use std::path::Path;
 
 // ── Default connection settings ───────────────────────────────
@@ -294,6 +291,7 @@ pub struct Ls350RecordingData {
     /// Input D2 (switch): calibrated temperature in K.
     pub input_d2_temp_k: Option<f64>,
     /// Input D3 (4K stage): voltage in V.
+    #[allow(dead_code)]
     pub input_d3_sensor_v: Option<f64>,
     /// Input D3 (4K stage): temperature in K (KRDG?).
     pub input_d3_temp_k: Option<f64>,
@@ -317,10 +315,6 @@ pub struct LakeShore350Controller {
     /// General query output (shown in GUI output panel / printed by CLI).
     pub output: String,
 
-    // ── GUI input fields (populated as tabs are added) ────────
-    /// Selected input channel label (e.g. "A", "D3").
-    pub selected_input: String,
-    
     /// 3-head temperature calibration (loaded lazily).
     three_head_cal: Option<ThreeHeadCalibration>,
     
@@ -338,7 +332,6 @@ impl Default for LakeShore350Controller {
             baud_rate: DEFAULT_BAUD,
             error_message: None,
             output: String::new(),
-            selected_input: "A".to_string(),
             three_head_cal: None,
             four_head_cal: None,
             pump_cal: None,
@@ -347,71 +340,6 @@ impl Default for LakeShore350Controller {
 }
 
 impl LakeShore350Controller {
-    // ── Serial helpers ────────────────────────────────────────
-
-    /// Open port, send `command\n`, read one line response.
-    /// Returns the trimmed response string, or an `Err` description.
-    fn send_command(&self, command: &str) -> Result<String, String> {
-        let mut port = serialport::new(&self.port, self.baud_rate)
-            .data_bits(DataBits::Seven)
-            .parity(Parity::Odd)
-            .stop_bits(StopBits::One)
-            .timeout(Duration::from_millis(2000))
-            .open()
-            .map_err(|e| format!("Failed to open {}: {}", self.port, e))?;
-
-        // Clear stale input
-        port.clear(serialport::ClearBuffer::Input).ok();
-
-        // Send command + newline (matches Python: command + '\n')
-        port.write_all(format!("{}\n", command).as_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-
-        // 300 ms settling time (matches Python time.sleep(0.3))
-        std::thread::sleep(Duration::from_millis(300));
-
-        // Read response until \n or timeout
-        let mut response = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match port.read(&mut byte) {
-                Ok(1) => {
-                    let c = byte[0] as char;
-                    if c == '\n' {
-                        break;
-                    } else if c != '\r' {
-                        response.push(c);
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        Ok(response.trim().to_string())
-    }
-
-    /// Open port, send `command\n`, wait 200 ms — no response expected.
-    /// Used for write-only commands such as INNAME.
-    fn send_write_command(&self, command: &str) -> Result<(), String> {
-        let mut port = serialport::new(&self.port, self.baud_rate)
-            .data_bits(DataBits::Seven)
-            .parity(Parity::Odd)
-            .stop_bits(StopBits::One)
-            .timeout(Duration::from_millis(2000))
-            .open()
-            .map_err(|e| format!("Failed to open {}: {}", self.port, e))?;
-
-        port.clear(serialport::ClearBuffer::Input).ok();
-
-        port.write_all(format!("{}\n", command).as_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-
-        // 200 ms settling time (matches Python time.sleep(0.2))
-        std::thread::sleep(Duration::from_millis(200));
-
-        Ok(())
-    }
-
     /// Validate output number (1–4).
     fn validate_output(output_num: u8) -> Result<(), String> {
         if ALL_OUTPUTS.contains(&output_num) {
@@ -426,7 +354,7 @@ impl LakeShore350Controller {
     /// `*IDN?` — device identification string.
     /// Equivalent to `lakeshore350 --info`.
     pub fn get_identification(&mut self) {
-        match self.send_command("*IDN?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "*IDN?", "\n", 300) {
             Ok(r) if !r.is_empty() => {
                 self.output = format!("Device Information:\n  {r}\n");
                 self.error_message = None;
@@ -453,7 +381,7 @@ impl LakeShore350Controller {
             ));
             return;
         }
-        match self.send_command(&format!("INNAME? {input}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("INNAME? {input}"), "\n", 300) {
             Ok(r) => {
                 let name = if r.is_empty() { "(no name set)" } else { &r };
                 self.output = format!("Input {input} display name: {name}\n");
@@ -472,7 +400,7 @@ impl LakeShore350Controller {
         let mut last_err: Option<String> = None;
 
         for &inp in &ALL_INPUTS {
-            match self.send_command(&format!("INNAME? {inp}")) {
+            match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("INNAME? {inp}"), "\n", 300) {
                 Ok(r) => {
                     let name = if r.is_empty() { "(no name set)" } else { &r };
                     out.push_str(&format!("  Input {inp}: {name}\n"));
@@ -503,7 +431,7 @@ impl LakeShore350Controller {
             ));
         }
         // The Lakeshore 350 expects: INNAME <input>,"<name>"
-        self.send_write_command(&format!("INNAME {input},\"{name}\""))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("INNAME {input},\"{name}\""), "\n", 200)?;
         Ok(())
     }
 
@@ -514,7 +442,7 @@ impl LakeShore350Controller {
     /// "R_OVER" on overrange, or "NO_RESPONSE" if the device is silent.
     /// Mirrors Python `read_sensor()` in temperature.py.
     fn read_sensor_raw(&self, input: &str) -> Result<String, String> {
-        let r = self.send_command(&format!("SRDG? {input}"))?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, &format!("SRDG? {input}"), "\n", 300)?;
         if r.is_empty() {
             return Ok("NO_RESPONSE".to_string());
         }
@@ -534,14 +462,14 @@ impl LakeShore350Controller {
     /// Mirrors Python `read_temperature()` in temperature.py.
     fn read_kelvin_raw(&self, input: &str) -> Result<String, String> {
         // Check overrange status first (bit 32 set → T_OVER)
-        if let Ok(status) = self.send_command(&format!("RDGST? {input}")) {
+        if let Ok(status) = crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGST? {input}"), "\n", 300) {
             if let Ok(code) = status.trim().parse::<u32>() {
                 if code & 32 != 0 {
                     return Ok("T_OVER".to_string());
                 }
             }
         }
-        let r = self.send_command(&format!("KRDG? {input}"))?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, &format!("KRDG? {input}"), "\n", 300)?;
         if r.is_empty() {
             return Ok("NO_RESPONSE".to_string());
         }
@@ -563,6 +491,7 @@ impl LakeShore350Controller {
     }
 
     /// `SRDG? <input>` — get raw sensor reading into `self.output`.
+    #[allow(dead_code)]
     pub fn get_sensor(&mut self, input: &str) {
         let input = input.to_uppercase();
         if !ALL_INPUTS.contains(&input.as_str()) {
@@ -587,6 +516,7 @@ impl LakeShore350Controller {
     }
 
     /// `KRDG? <input>` (with `RDGST?` check) — get temperature in Kelvin into `self.output`.
+    #[allow(dead_code)]
     pub fn get_kelvin(&mut self, input: &str) {
         let input = input.to_uppercase();
         if !ALL_INPUTS.contains(&input.as_str()) {
@@ -1066,7 +996,7 @@ impl LakeShore350Controller {
     /// Send an arbitrary command string and put the response in `output`.
     /// Equivalent to `lakeshore350 --raw-command <command>`.
     pub fn raw_command(&mut self, command: &str) {
-        match self.send_command(command) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, command, "\n", 300) {
             Ok(r) => {
                 self.output = format!(
                     ">> {command}\n{}\n",
@@ -1087,7 +1017,7 @@ impl LakeShore350Controller {
             self.error_message = Some(e);
             return;
         }
-        match self.send_write_command(&format!("RANGE {output_num},{range_val}")) {
+        match crate::serial::scpi_write(&self.port, self.baud_rate, &format!("RANGE {output_num},{range_val}"), "\n", 200) {
             Ok(()) => {
                 self.output = format!("Sent: RANGE {output_num},{range_val}\n");
                 self.error_message = None;
@@ -1107,7 +1037,7 @@ impl LakeShore350Controller {
             self.error_message = Some("Percent must be between 0 and 100.".to_string());
             return;
         }
-        match self.send_write_command(&format!("MOUT {output_num},{percent}")) {
+        match crate::serial::scpi_write(&self.port, self.baud_rate, &format!("MOUT {output_num},{percent}"), "\n", 200) {
             Ok(()) => {
                 self.output = format!("Set Output {output_num} to {percent}%\n");
                 self.error_message = None;
@@ -1138,7 +1068,7 @@ impl LakeShore350Controller {
         } else {
             format!("ANALOG {output_num},{param_str}")
         };
-        match self.send_write_command(&cmd) {
+        match crate::serial::scpi_write(&self.port, self.baud_rate, &cmd, "\n", 200) {
             Ok(()) => {
                 self.output = format!("Sent: {cmd}\n");
                 self.error_message = None;
@@ -1156,17 +1086,17 @@ impl LakeShore350Controller {
         }
         let mut out = String::new();
         let mut last_err: Option<String> = None;
-        match self.send_command(&format!("MOUT? {output_num}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("MOUT? {output_num}"), "\n", 300) {
             Ok(r) => out.push_str(&format!("MOUT (Manual Output %) {output_num}: {r}\n")),
             Err(e) => { out.push_str(&format!("MOUT? {output_num}: ERROR ({e})\n")); last_err = Some(e); }
         }
         if output_num <= 2 {
-            match self.send_command(&format!("HTR? {output_num}")) {
+            match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("HTR? {output_num}"), "\n", 300) {
                 Ok(r) => out.push_str(&format!("HTR (Heater Output %) {output_num}: {r}\n")),
                 Err(e) => { out.push_str(&format!("HTR? {output_num}: ERROR ({e})\n")); last_err = Some(e); }
             }
         } else {
-            match self.send_command(&format!("AOUT? {output_num}")) {
+            match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("AOUT? {output_num}"), "\n", 300) {
                 Ok(r) => out.push_str(&format!("AOUT (Analog Output %) {output_num}: {r}\n")),
                 Err(e) => { out.push_str(&format!("AOUT? {output_num}: ERROR ({e})\n")); last_err = Some(e); }
             }
@@ -1186,7 +1116,7 @@ impl LakeShore350Controller {
         let mut out = String::new();
         let mut last_err: Option<String> = None;
 
-        match self.send_command(&format!("MOUT? {output_num}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("MOUT? {output_num}"), "\n", 300) {
             Ok(r) => out.push_str(&format!(
                 "MOUT (Manual Output Percentage) {output_num} Status: {r}\n"
             )),
@@ -1197,14 +1127,14 @@ impl LakeShore350Controller {
         }
 
         if output_num <= 2 {
-            match self.send_command(&format!("HTR? {output_num}")) {
+            match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("HTR? {output_num}"), "\n", 300) {
                 Ok(r) => out.push_str(&format!("HTR? {output_num} : {r}\n")),
                 Err(e) => {
                     out.push_str(&format!("HTR? {output_num}: ERROR ({e})\n"));
                     last_err = Some(e);
                 }
             }
-            match self.send_command(&format!("HTRSET? {output_num}")) {
+            match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("HTRSET? {output_num}"), "\n", 300) {
                 Ok(r) => out.push_str(&format!(
                     "HTRSET? (<htr resistance>,<max current>,<max user current>,<current/power>) {output_num} : {r}\n"
                 )),
@@ -1214,14 +1144,14 @@ impl LakeShore350Controller {
                 }
             }
         } else {
-            match self.send_command(&format!("AOUT? {output_num}")) {
+            match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("AOUT? {output_num}"), "\n", 300) {
                 Ok(r) => out.push_str(&format!("AOUT? {output_num} Status: {r}\n")),
                 Err(e) => {
                     out.push_str(&format!("AOUT? {output_num}: ERROR ({e})\n"));
                     last_err = Some(e);
                 }
             }
-            match self.send_command(&format!("ANALOG? {output_num}")) {
+            match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("ANALOG? {output_num}"), "\n", 300) {
                 Ok(r) => out.push_str(&format!("ANALOG? {output_num} Status: {r}\n")),
                 Err(e) => {
                     out.push_str(&format!("ANALOG? {output_num}: ERROR ({e})\n"));
@@ -1230,7 +1160,7 @@ impl LakeShore350Controller {
             }
         }
 
-        match self.send_command(&format!("OUTMODE? {output_num}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("OUTMODE? {output_num}"), "\n", 300) {
             Ok(r) => out.push_str(&format!("OUTMODE? {output_num} Status: {r}\n")),
             Err(e) => {
                 out.push_str(&format!("OUTMODE? {output_num}: ERROR ({e})\n"));
@@ -1238,7 +1168,7 @@ impl LakeShore350Controller {
             }
         }
 
-        match self.send_command(&format!("RANGE? {output_num}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RANGE? {output_num}"), "\n", 300) {
             Ok(r) => out.push_str(&format!("RANGE? {output_num} Status: {r}\n")),
             Err(e) => {
                 out.push_str(&format!("RANGE? {output_num}: ERROR ({e})\n"));

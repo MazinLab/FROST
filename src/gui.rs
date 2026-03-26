@@ -1,10 +1,7 @@
 // gui.rs — Minimal GUI shell for FROST (header + theme options only)
 
 use eframe::egui;
-use crate::compressor::CryomechController;
-use crate::lakeshore350::LakeShore350Controller;
-use crate::lakeshore370::LakeShore370Controller;
-use crate::lakeshore625::LakeShore625Controller;
+use crate::worker::{DeviceSnapshot, GuiCommand, SerialWorker};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
@@ -22,7 +19,8 @@ pub fn run() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             apply_fonts(&cc.egui_ctx);
-            Box::new(FrostApp::default())
+            let worker = SerialWorker::spawn(cc.egui_ctx.clone());
+            Box::new(FrostApp::new(worker))
         }),
     )
 }
@@ -55,93 +53,50 @@ enum Theme {
 
 struct FrostApp {
     selected_theme: Theme,
-    lakeshore_350: LakeShore350Controller,
-    lakeshore_370: LakeShore370Controller,
-    temperatures: TemperatureReadings,
-    last_temp_update: Instant,
-    /// Status / error from the last "Record Temps" button press.
-    record_result: Option<Result<String, String>>,
-    /// Stop flag for the background recording thread (None = not recording).
-    recording_stop_flag: Option<Arc<AtomicBool>>,
-    /// Path of the CSV file currently being recorded to.
-    recording_csv_path: Option<String>,
-    // ── Compressor ───────────────────────────────────────────
-    compressor: CryomechController,
-    /// Whether the compressor is believed to be running (GUI state).
-    compressor_running: bool,
-    /// Last status string from get_status().
-    compressor_status: String,
-    /// Timestamp of last compressor status poll.
-    last_compressor_update: Instant,
-    /// Any error from the last compressor start/stop attempt.
-    compressor_error: Option<String>,
-    // ── Magnet / ADR ─────────────────────────────────────────
-    lakeshore_625: LakeShore625Controller,
-    /// Target current for the ramp (A); defaults to 9.44 A.
-    magnet_target_current: f64,
-    /// Cached output of the last `get_limits()` call.
-    magnet_limits: String,
-    /// Timestamp of the last magnet limits poll.
-    last_magnet_limits_update: Instant,
-    /// Any error from the last magnet ramp attempt.
-    magnet_error: Option<String>,
-    /// Editable limit fields (populated from LIMIT? and sent via LIMIT).
-    magnet_edit_current_limit: f64,
-    magnet_edit_voltage_limit: f64,
-    magnet_edit_rate_limit: f64,
-    /// Error/success message from the last "Set Limits" action.
-    magnet_limits_set_msg: Option<Result<(), String>>,
-    /// Editable ramp rate (A/s), synced from RATE?.
-    magnet_edit_ramp_rate: f64,
-    /// Error/success from the last "Set Rate" action.
-    magnet_rate_set_msg: Option<Result<(), String>>,
-    /// Editable compliance voltage (V), synced from SETV?.
+    worker: SerialWorker,
+
+    // ── User-editable fields (live on the GUI side) ───────────
+    magnet_target_current:        f64,
+    magnet_edit_current_limit:    f64,
+    magnet_edit_voltage_limit:    f64,
+    magnet_edit_rate_limit:       f64,
+    magnet_edit_ramp_rate:        f64,
     magnet_edit_compliance_voltage: f64,
-    /// Error/success from the last "Set Compliance" action.
-    magnet_compliance_set_msg: Option<Result<(), String>>,
-    /// Cached quench detection status (QNCH?).
-    magnet_quench_status: String,
-    /// Live readback values polled every 30 s (RDGI?, RDGV?, RDGF?).
-    magnet_live_current: String,
-    magnet_live_voltage: String,
-    magnet_live_field: String,
-    // ── GL7 Sorption Cooler ──────────────────────────────────
-    /// First 2 lines of query_output_percentages for outputs 1–4.
-    /// Each entry is (line1, line2) — MOUT% and HTR%/AOUT%.
-    gl7_output_lines: Vec<(String, String)>,
-    last_gl7_update: Instant,
-    /// Editable manual output percentages for outputs 1–4 (0–100).
     gl7_edit_pct: Vec<f64>,
-    /// Per-output feedback from the last "Set Heater Output" click.
+
+    // ── Sync tracking: detect new poll data to refresh edit fields ──
+    last_synced_magnet: Option<Instant>,
+    last_synced_gl7:    Option<Instant>,
+
+    // ── Command feedback (drained from snapshot each frame) ───
+    compressor_error:         Option<String>,
+    magnet_error:             Option<String>,
+    magnet_limits_set_msg:    Option<Result<(), String>>,
+    magnet_rate_set_msg:      Option<Result<(), String>>,
+    magnet_compliance_set_msg: Option<Result<(), String>>,
     gl7_set_msg: Vec<Option<Result<(), String>>>,
-    /// Global serial gate: no poll may start before this Instant.
-    /// Prevents two sections from hitting serial ports simultaneously.
-    serial_gate: Instant,
+
+    // ── Temperature recording ─────────────────────────────────
+    record_result:        Option<Result<String, String>>,
+    recording_stop_flag:  Option<Arc<AtomicBool>>,
+    recording_csv_path:   Option<String>,
+
+    // ── ADR ramp ──────────────────────────────────────────────
+    adr_ramp_rate:      f64,
+    adr_ramp_current:   f64,
+    adr_ramp_soak_mins: u64,
+    adr_ramp_result:    Option<Result<(), String>>,
 }
 
-#[derive(Default)]
-struct TemperatureReadings {
-    ls350_a: String,    // 3-head
-    ls350_b: String,    // ADR
-    ls350_c: String,    // 4-head
-    ls350_d2: String,   // Switch voltage (no temp)
-    ls350_d3: String,   // 4K stage
-    ls350_d4: String,   // 3-pump
-    ls350_d5: String,   // 4-pump
-    ls370_1: String,    // Input 1
-    error_message: Option<String>,
-}
-
-impl Default for FrostApp {
-    fn default() -> Self {
-        // Resume recording if a session was active when the GUI was last closed.
+impl FrostApp {
+    fn new(worker: SerialWorker) -> Self {
         let (recording_stop_flag, recording_csv_path, record_result) =
             if crate::record_temps::is_recording_active() {
                 match crate::record_temps::start_recording_loop(30, "temps") {
                     Ok((path, flag)) => (
                         Some(flag),
                         Some(path.clone()),
-                        Some(Ok(format!("Resumed recording → {}", path))),
+                        Some(Ok(format!("Resumed recording → {path}"))),
                     ),
                     Err(e) => (None, None, Some(Err(e))),
                 }
@@ -151,44 +106,48 @@ impl Default for FrostApp {
 
         Self {
             selected_theme: Theme::EguiLightBlue,
-            lakeshore_350: LakeShore350Controller::default(),
-            lakeshore_370: LakeShore370Controller::default(),
-            temperatures: TemperatureReadings::default(),
-            // Staggered: fires ~28 s after compressor
-            last_temp_update: Instant::now() - Duration::from_secs(2),
+            worker,
+            magnet_target_current:          9.44,
+            magnet_edit_current_limit:      10.0,
+            magnet_edit_voltage_limit:       1.0,
+            magnet_edit_rate_limit:          0.1,
+            magnet_edit_ramp_rate:           0.01,
+            magnet_edit_compliance_voltage:  1.0,
+            gl7_edit_pct: vec![0.0; 4],
+            last_synced_magnet: None,
+            last_synced_gl7:    None,
+            compressor_error:          None,
+            magnet_error:              None,
+            magnet_limits_set_msg:     None,
+            magnet_rate_set_msg:       None,
+            magnet_compliance_set_msg: None,
+            gl7_set_msg: vec![None, None, None, None],
             record_result,
             recording_stop_flag,
             recording_csv_path,
-            compressor: CryomechController::default(),
-            compressor_running: false,   // synced on first status poll
-            compressor_status: String::new(),
-            // Fires immediately (first poll on startup)
-            last_compressor_update: Instant::now() - Duration::from_secs(35),
-            compressor_error: None,
-            lakeshore_625: LakeShore625Controller::default(),
-            magnet_target_current: 9.44,
-            magnet_limits: String::new(),
-            // Staggered: fires ~10 s after compressor (compressor fires immediately at -35s)
-            last_magnet_limits_update: Instant::now() - Duration::from_secs(22),
-            magnet_error: None,
-            magnet_edit_current_limit: 10.0,
-            magnet_edit_voltage_limit: 1.0,
-            magnet_edit_rate_limit: 0.1,
-            magnet_limits_set_msg: None,
-            magnet_edit_ramp_rate: 0.01,
-            magnet_rate_set_msg: None,
-            magnet_edit_compliance_voltage: 1.0,
-            magnet_compliance_set_msg: None,
-            magnet_quench_status: String::new(),
-            magnet_live_current: String::new(),
-            magnet_live_voltage: String::new(),
-            magnet_live_field: String::new(),
-            gl7_output_lines: vec![(String::new(), String::new()); 4],
-            // Staggered: fires ~20 s after compressor
-            last_gl7_update: Instant::now() - Duration::from_secs(12),
-            gl7_edit_pct: vec![0.0; 4],
-            gl7_set_msg: vec![None, None, None, None],
-            serial_gate: Instant::now(),
+            adr_ramp_rate:      0.004,
+            adr_ramp_current:   9.44,
+            adr_ramp_soak_mins: 45,
+            adr_ramp_result:    None,
+        }
+    }
+
+    /// Sync hardware-polled values into GUI edit fields when new data arrives.
+    fn sync_edit_fields(&mut self, snap: &DeviceSnapshot) {
+        if snap.last_magnet_update != self.last_synced_magnet {
+            if let Some(v) = snap.magnet_polled_current_limit      { self.magnet_edit_current_limit      = v; }
+            if let Some(v) = snap.magnet_polled_voltage_limit      { self.magnet_edit_voltage_limit      = v; }
+            if let Some(v) = snap.magnet_polled_rate_limit         { self.magnet_edit_rate_limit         = v; }
+            if let Some(v) = snap.magnet_polled_ramp_rate          { self.magnet_edit_ramp_rate          = v; self.adr_ramp_rate = v; }
+            if let Some(v) = snap.magnet_polled_compliance_voltage { self.magnet_edit_compliance_voltage = v; }
+            if let Some(v) = snap.magnet_polled_target_current     { self.magnet_target_current          = v; }
+            self.last_synced_magnet = snap.last_magnet_update;
+        }
+        if snap.last_gl7_update != self.last_synced_gl7 {
+            for (i, pct) in snap.gl7_polled_pct.iter().enumerate() {
+                if let Some(v) = pct { self.gl7_edit_pct[i] = *v; }
+            }
+            self.last_synced_gl7 = snap.last_gl7_update;
         }
     }
 }
@@ -197,106 +156,131 @@ impl eframe::App for FrostApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
 
+        // ── 1. Drain command results and clone snapshot (brief mutex hold) ──
+        let snap = {
+            let mut s = self.worker.snapshot.lock().unwrap();
+
+            if let Some(r) = s.compressor_cmd_result.take() {
+                match r {
+                    Ok(())  => self.compressor_error = None,
+                    Err(e)  => self.compressor_error = Some(e),
+                }
+            }
+            if let Some(r) = s.magnet_cmd_result.take() {
+                match r {
+                    Ok(())  => self.magnet_error = None,
+                    Err(e)  => self.magnet_error = Some(e),
+                }
+            }
+            if let Some(r) = s.magnet_rate_result.take()       { self.magnet_rate_set_msg       = Some(r); }
+            if let Some(r) = s.magnet_compliance_result.take() { self.magnet_compliance_set_msg  = Some(r); }
+            if let Some(r) = s.magnet_limits_result.take()     { self.magnet_limits_set_msg      = Some(r); }
+            for i in 0..4 {
+                if let Some(r) = s.gl7_set_results[i].take()   { self.gl7_set_msg[i]            = Some(r); }
+            }
+            if let Some(r) = s.adr_ramp_result.take() { self.adr_ramp_result = Some(r); }
+
+            s.clone()
+        };
+
+        // ── 2. Sync edit fields when new poll data arrives ────────────────
+        self.sync_edit_fields(&snap);
+
+        // ── 3. Render ─────────────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(8.0);
+                ui.add_space(8.0);
 
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("FROST")
-                        .size(48.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(30, 30, 120)),
-                )
-                .selectable(false),
-            );
-            ui.label("Fridge Remote Operations, Status, and Thermometry");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("FROST")
+                            .size(48.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(30, 30, 120)),
+                    )
+                    .selectable(false),
+                );
+                ui.label("Fridge Remote Operations, Status, and Thermometry");
 
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(10.0);
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
 
-            ui.strong("Theme / Color");
+                ui.strong("Theme / Color");
 
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Theme:");
-                ui.selectable_value(&mut self.selected_theme, Theme::Default, "Default");
-                ui.selectable_value(&mut self.selected_theme, Theme::LightBlue, "Light Blue");
-                ui.selectable_value(&mut self.selected_theme, Theme::Purple, "Purple");
-                ui.selectable_value(&mut self.selected_theme, Theme::Dark, "Dark");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Theme:");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Default, "Default");
+                    ui.selectable_value(&mut self.selected_theme, Theme::LightBlue, "Light Blue");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Purple, "Purple");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Dark, "Dark");
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Colors:");
+                    ui.selectable_value(&mut self.selected_theme, Theme::White, "White");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Black, "Black");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Red, "Red");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Green, "Green");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Blue, "Blue");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Yellow, "Yellow");
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("More:");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Cyan, "Cyan");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Magenta, "Magenta");
+                    ui.selectable_value(&mut self.selected_theme, Theme::Gray, "Gray");
+                    ui.selectable_value(&mut self.selected_theme, Theme::LightGray, "Light Gray");
+                    ui.selectable_value(&mut self.selected_theme, Theme::DarkGray, "Dark Gray");
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Egui:");
+                    ui.selectable_value(&mut self.selected_theme, Theme::EguiLightBlue, "Egui Light Blue");
+                    ui.selectable_value(&mut self.selected_theme, Theme::EguiLightGreen, "Egui Light Green");
+                    ui.selectable_value(&mut self.selected_theme, Theme::EguiLightRed, "Egui Light Red");
+                });
+
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                self.show_compressor_section(ui, &snap);
+
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                self.show_magnet_section(ui, &snap, ctx);
+
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                self.show_gl7_section(ui, &snap);
+
+                ui.add_space(20.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Thermometry")
+                            .size(32.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(40, 40, 140)),
+                    )
+                    .selectable(false),
+                );
+                ui.add_space(10.0);
+
+                self.show_temperature_display(ui, &snap);
             });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Colors:");
-                ui.selectable_value(&mut self.selected_theme, Theme::White, "White");
-                ui.selectable_value(&mut self.selected_theme, Theme::Black, "Black");
-                ui.selectable_value(&mut self.selected_theme, Theme::Red, "Red");
-                ui.selectable_value(&mut self.selected_theme, Theme::Green, "Green");
-                ui.selectable_value(&mut self.selected_theme, Theme::Blue, "Blue");
-                ui.selectable_value(&mut self.selected_theme, Theme::Yellow, "Yellow");
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label("More:");
-                ui.selectable_value(&mut self.selected_theme, Theme::Cyan, "Cyan");
-                ui.selectable_value(&mut self.selected_theme, Theme::Magenta, "Magenta");
-                ui.selectable_value(&mut self.selected_theme, Theme::Gray, "Gray");
-                ui.selectable_value(&mut self.selected_theme, Theme::LightGray, "Light Gray");
-                ui.selectable_value(&mut self.selected_theme, Theme::DarkGray, "Dark Gray");
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Egui:");
-                ui.selectable_value(&mut self.selected_theme, Theme::EguiLightBlue, "Egui Light Blue");
-                ui.selectable_value(&mut self.selected_theme, Theme::EguiLightGreen, "Egui Light Green");
-                ui.selectable_value(&mut self.selected_theme, Theme::EguiLightRed, "Egui Light Red");
-            });
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            // Compressor section
-            self.update_compressor_status_if_needed();
-            self.show_compressor_section(ui);
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            // Magnet / ADR section
-            self.update_magnet_limits_if_needed();
-            self.show_magnet_section(ui);
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            // GL7 Sorption Cooler section
-            self.update_gl7_if_needed();
-            self.show_gl7_section(ui);
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.add_space(10.0);
-
-            // Thermometry header
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("Thermometry")
-                        .size(32.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(40, 40, 140)),
-                )
-                .selectable(false),
-            );
-            ui.add_space(10.0);
-
-            // Temperature readings section
-            self.update_temperatures_if_needed();
-            self.show_temperature_display(ui);
-            }); // end ScrollArea
         });
+
+        // ── 4. Repaint every second to keep "X s ago" counters ticking ───
+        ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
 
@@ -395,7 +379,6 @@ impl FrostApp {
             }
         }
 
-        // Keep buttons readable with consistent white/blue styling
         if style.visuals.dark_mode {
             style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 55);
             style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(55, 80, 130);
@@ -406,7 +389,6 @@ impl FrostApp {
             style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(120, 170, 255);
         }
 
-        // Add subtle outline so white buttons are visible
         style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
         style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
         style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(160));
@@ -414,68 +396,10 @@ impl FrostApp {
         ctx.set_style(style);
     }
 
-    /// Poll magnet limits, ramp rate, compliance voltage, and set-current every 30 seconds.
-    fn update_magnet_limits_if_needed(&mut self) {
-        if self.last_magnet_limits_update.elapsed() >= Duration::from_secs(30)
-            && Instant::now() >= self.serial_gate
-        {
-            // ~8 commands × 200 ms each → reserve 5 s on the gate
-            self.serial_gate = Instant::now() + Duration::from_secs(5);
-            // LIMIT?
-            self.lakeshore_625.get_limits();
-            if let Some(e) = &self.lakeshore_625.error_message.clone() {
-                self.magnet_limits = format!("Error: {}", e);
-            } else {
-                let output = self.lakeshore_625.output.clone();
-                self.magnet_limits = output.clone();
-                if let Some((c, v, r)) = parse_limits_from_output(&output) {
-                    self.magnet_edit_current_limit = c;
-                    self.magnet_edit_voltage_limit = v;
-                    self.magnet_edit_rate_limit = r;
-                }
-            }
-            // SETI? — sync target current box
-            self.lakeshore_625.get_set_current();
-            if self.lakeshore_625.error_message.is_none() {
-                let out = self.lakeshore_625.output.clone();
-                if let Some(val) = parse_single_value(&out) {
-                    self.magnet_target_current = val;
-                }
-            }
-            // RATE?
-            self.lakeshore_625.get_ramp_rate();
-            if self.lakeshore_625.error_message.is_none() {
-                let out = self.lakeshore_625.output.clone();
-                if let Some(val) = parse_single_value(&out) {
-                    self.magnet_edit_ramp_rate = val;
-                }
-            }
-            // SETV?
-            self.lakeshore_625.get_compliance_voltage();
-            if self.lakeshore_625.error_message.is_none() {
-                let out = self.lakeshore_625.output.clone();
-                if let Some(val) = parse_single_value(&out) {
-                    self.magnet_edit_compliance_voltage = val;
-                }
-            }
-            // QNCH?
-            self.lakeshore_625.get_quench_status();
-            if self.lakeshore_625.error_message.is_none() {
-                self.magnet_quench_status = self.lakeshore_625.output.clone();
-            }
-            // Live readings: RDGI?, RDGV?, RDGF?
-            if let Ok(v) = self.lakeshore_625.get_current() { self.magnet_live_current = v; }
-            if let Ok(v) = self.lakeshore_625.get_voltage() { self.magnet_live_voltage = v; }
-            if let Ok(v) = self.lakeshore_625.get_field()   { self.magnet_live_field   = v; }
-            self.last_magnet_limits_update = Instant::now();
-        }
-    }
-
-    /// Draw the Magnet / ADR ramp controls and limits block.
-    fn show_magnet_section(&mut self, ui: &mut egui::Ui) {
+    fn show_compressor_section(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
         ui.add(
             egui::Label::new(
-                egui::RichText::new("Magnet / ADR")
+                egui::RichText::new("Compressor")
                     .size(32.0)
                     .strong()
                     .color(egui::Color32::from_rgb(40, 40, 140)),
@@ -484,22 +408,101 @@ impl FrostApp {
         );
         ui.add_space(6.0);
 
-        // ── Live readback cards ───────────────────────────────────
+        ui.horizontal(|ui| {
+            if snap.compressor_running {
+                let btn = egui::Button::new(
+                    egui::RichText::new("⏹  Stop Compressor").strong()
+                )
+                .fill(egui::Color32::from_rgb(180, 40, 40));
+                if ui.add(btn).clicked() {
+                    self.compressor_error = None;
+                    self.worker.send(GuiCommand::StopCompressor);
+                }
+            } else {
+                let btn = egui::Button::new(
+                    egui::RichText::new("▶  Start Pulse Tube Cooldown").strong()
+                )
+                .fill(egui::Color32::from_rgb(30, 120, 60));
+                if ui.add(btn).clicked() {
+                    self.compressor_error = None;
+                    self.worker.send(GuiCommand::StartCompressor);
+                }
+            }
+        });
+
+        if let Some(ref e) = self.compressor_error {
+            ui.colored_label(egui::Color32::RED, format!("Compressor error: {e}"));
+        }
+
+        ui.add_space(6.0);
+
+        if !snap.compressor_status.is_empty() {
+            for line in snap.compressor_status.lines() {
+                if line.starts_with("Runtime:") {
+                    continue;
+                } else if line.starts_with("Running:") {
+                    let is_yes = line.contains("Yes");
+                    let color = if is_yes {
+                        egui::Color32::from_rgb(20, 140, 20)
+                    } else {
+                        egui::Color32::from_rgb(160, 30, 30)
+                    };
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(line).strong().size(22.0).color(color),
+                    ).selectable(false));
+                } else if line.starts_with("Errors/Warnings:") {
+                    let has_errors = line.contains("Yes");
+                    let color = if has_errors {
+                        egui::Color32::from_rgb(200, 80, 0)
+                    } else {
+                        egui::Color32::DARK_GREEN
+                    };
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(line).strong().size(18.0).color(color),
+                    ).selectable(false));
+                } else {
+                    ui.label(line);
+                }
+            }
+            if let Some(t) = snap.last_compressor_update {
+                ui.label(format!(
+                    "Last updated: {:.1}s ago  (refreshes every 30 s)",
+                    t.elapsed().as_secs_f32()
+                ));
+            }
+        } else {
+            ui.label("Compressor status: (pending first poll…)");
+        }
+    }
+
+    fn show_magnet_section(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot, ctx: &egui::Context) {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("ADR Cooldown")
+                    .size(32.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(40, 40, 140)),
+            )
+            .selectable(false),
+        );
+        ui.add_space(6.0);
+
+        // ── Live readback cards ──────────────────────────────────
         {
-            let current_str = if self.magnet_live_current.is_empty() {
+            let current_str = if snap.magnet_current.is_empty() {
                 "—".to_string()
             } else {
-                format!("{} A", self.magnet_live_current)
+                format!("{} A", snap.magnet_current)
             };
-            let voltage_str = if self.magnet_live_voltage.is_empty() {
+            let voltage_str = if snap.magnet_voltage.is_empty() {
                 "—".to_string()
             } else {
-                format!("{} V", self.magnet_live_voltage)
+                format!("{} V", snap.magnet_voltage)
             };
-            let field_str = if self.magnet_live_field.is_empty() {
+            let field_str = if snap.magnet_field.is_empty() {
                 "—".to_string()
             } else {
-                format!("{} T", self.magnet_live_field)
+                format!("{} T", snap.magnet_field)
             };
 
             let cards: &[(&str, &str, &str)] = &[
@@ -539,258 +542,240 @@ impl FrostApp {
 
         ui.add_space(8.0);
 
-        // ── Ramp controls ────────────────────────────────────────
-        ui.horizontal(|ui| {
-            ui.label("Target Current (A):");
-            ui.add(
-                egui::DragValue::new(&mut self.magnet_target_current)
-                    .speed(0.01)
-                    .clamp_range(0.0_f64..=60.1_f64)
-                    .fixed_decimals(2),
+        // ── Interrupted-ramp warning (set when lock file found on startup) ──
+        if snap.adr_ramp_interrupted {
+            ui.add_space(4.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "⚠  ADR ramp was running when the GUI was last closed — it did not complete.",
             );
+            ui.add_space(4.0);
+        }
 
-            ui.add_space(8.0);
-
+        // ── Start button / running indicator ─────────────────────
+        if snap.adr_ramp_running {
+            let elapsed = snap.adr_ramp_started
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            let mins = elapsed / 60;
+            let secs = elapsed % 60;
             let btn = egui::Button::new(
-                egui::RichText::new("▶  Ramp Magnet").strong(),
+                egui::RichText::new(
+                    format!("⏳  ADR Ramp Running…  {mins}m {secs:02}s elapsed")
+                ).strong(),
+            )
+            .fill(egui::Color32::from_rgb(140, 100, 20));
+            ui.add_enabled(false, btn);
+        } else {
+            let btn = egui::Button::new(
+                egui::RichText::new("▶  Start Automated ADR Ramp").strong(),
             )
             .fill(egui::Color32::from_rgb(40, 80, 170));
-
             if ui.add(btn).clicked() {
-                let target = self.magnet_target_current;
-                match self.lakeshore_625.set_current(target) {
-                    Ok(()) => {
-                        self.magnet_error = None;
-                        // Refresh limits immediately after ramping
-                        self.lakeshore_625.get_limits();
-                        if self.lakeshore_625.error_message.is_none() {
-                            self.magnet_limits = self.lakeshore_625.output.clone();
-                        }
-                        self.last_magnet_limits_update = Instant::now();
-                    }
-                    Err(e) => self.magnet_error = Some(e),
-                }
+                self.adr_ramp_result = None;
+                self.worker.send(GuiCommand::RunAdrRamp {
+                    rate:      self.adr_ramp_rate,
+                    current:   self.adr_ramp_current,
+                    soak_mins: self.adr_ramp_soak_mins,
+                });
             }
-        });
-
-        // Error line
-        if let Some(ref e) = self.magnet_error {
-            ui.colored_label(egui::Color32::RED, format!("Magnet error: {}", e));
         }
 
-        ui.add_space(6.0);
-
-        // ── Two-column settings block ─────────────────────────────
-        ui.columns(2, |cols| {
-            // ── Left column: Ramp rate & Compliance voltage ──────
-            cols[0].strong("Ramp Rate & Compliance");
-            cols[0].add_space(4.0);
-
-            egui::Grid::new("magnet_ramp_grid")
-                .num_columns(4)
-                .spacing([8.0, 6.0])
-                .show(&mut cols[0], |ui| {
-                    // Ramp rate row
-                    ui.label("Ramp rate:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.magnet_edit_ramp_rate)
-                            .speed(0.001)
-                            .clamp_range(0.0001_f64..=99.999_f64)
-                            .fixed_decimals(4),
-                    );
-                    ui.label("A/s");
-                    let rate_btn = egui::Button::new(egui::RichText::new("Set Rate").strong())
-                        .fill(egui::Color32::from_rgb(80, 120, 60));
-                    if ui.add(rate_btn).clicked() {
-                        let r = self.magnet_edit_ramp_rate;
-                        match self.lakeshore_625.set_ramp_rate(r) {
-                            Ok(()) => {
-                                self.lakeshore_625.get_ramp_rate();
-                                if self.lakeshore_625.error_message.is_none() {
-                                    let out = self.lakeshore_625.output.clone();
-                                    if let Some(val) = parse_single_value(&out) {
-                                        self.magnet_edit_ramp_rate = val;
-                                    }
-                                }
-                                self.magnet_rate_set_msg = Some(Ok(()));
+        // ── Live ramp log ─────────────────────────────────────────
+        if !snap.adr_log_lines.is_empty() || snap.adr_ramp_running {
+            ui.add_space(6.0);
+            egui::Frame::none()
+                .fill(egui::Color32::from_gray(18))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(egui::Margin::same(8.0))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_source("adr_log_scroll")
+                        .max_height(200.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in &snap.adr_log_lines {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(160, 210, 160)),
+                                ).selectable(false));
                             }
-                            Err(e) => self.magnet_rate_set_msg = Some(Err(e)),
-                        }
-                    }
-                    ui.end_row();
-
-                    // Rate feedback
-                    ui.label("");
-                    if let Some(ref msg) = self.magnet_rate_set_msg.clone() {
-                        match msg {
-                            Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Rate set."); }
-                            Err(e) => { ui.colored_label(egui::Color32::RED, e.as_str()); }
-                        }
-                    }
-                    ui.end_row();
-
-                    // Compliance voltage row
-                    ui.label("Compliance V:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.magnet_edit_compliance_voltage)
-                            .speed(0.01)
-                            .clamp_range(0.1_f64..=5.0_f64)
-                            .fixed_decimals(2),
-                    );
-                    ui.label("V");
-                    let comp_btn = egui::Button::new(egui::RichText::new("Set Compliance").strong())
-                        .fill(egui::Color32::from_rgb(80, 120, 60));
-                    if ui.add(comp_btn).clicked() {
-                        let v = self.magnet_edit_compliance_voltage;
-                        match self.lakeshore_625.set_compliance_voltage(v) {
-                            Ok(()) => {
-                                self.lakeshore_625.get_compliance_voltage();
-                                if self.lakeshore_625.error_message.is_none() {
-                                    let out = self.lakeshore_625.output.clone();
-                                    if let Some(val) = parse_single_value(&out) {
-                                        self.magnet_edit_compliance_voltage = val;
-                                    }
-                                }
-                                self.magnet_compliance_set_msg = Some(Ok(()));
+                            if !snap.adr_status_line.is_empty() {
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(&snap.adr_status_line)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(egui::Color32::YELLOW),
+                                ).selectable(false));
                             }
-                            Err(e) => self.magnet_compliance_set_msg = Some(Err(e)),
-                        }
-                    }
-                    ui.end_row();
-
-                    // Compliance feedback
-                    ui.label("");
-                    if let Some(ref msg) = self.magnet_compliance_set_msg.clone() {
-                        match msg {
-                            Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Compliance set."); }
-                            Err(e) => { ui.colored_label(egui::Color32::RED, e.as_str()); }
-                        }
-                    }
-                    ui.end_row();
+                        });
                 });
+        }
 
-            // ── Right column: Limits ─────────────────────────────
-            cols[1].strong("Limits (LIMIT?)");
+        // Request repaint every second while running to keep the elapsed timer fresh.
+        if snap.adr_ramp_running {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
 
-            if self.magnet_limits.starts_with("Error:") {
-                cols[1].colored_label(egui::Color32::RED, &self.magnet_limits.clone());
-            } else if self.magnet_limits.is_empty() {
-                cols[1].label("(pending first poll…)");
+        // ── Result feedback ───────────────────────────────────────
+        if let Some(ref res) = self.adr_ramp_result {
+            ui.add_space(4.0);
+            match res {
+                Ok(())  => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ ADR ramp sequence complete."); }
+                Err(e)  => { ui.colored_label(egui::Color32::RED, format!("ADR ramp error: {e}")); }
             }
+        }
 
-            egui::Grid::new("magnet_limits_grid")
-                .num_columns(3)
-                .spacing([8.0, 4.0])
-                .show(&mut cols[1], |ui| {
-                    ui.label("Current limit:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.magnet_edit_current_limit)
-                            .speed(0.1)
-                            .clamp_range(0.0_f64..=60.1_f64)
-                            .fixed_decimals(2),
-                    );
-                    ui.label("A");
-                    ui.end_row();
+        ui.add_space(8.0);
 
-                    ui.label("Voltage limit:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.magnet_edit_voltage_limit)
-                            .speed(0.01)
-                            .clamp_range(0.1_f64..=5.0_f64)
-                            .fixed_decimals(2),
-                    );
-                    ui.label("V");
-                    ui.end_row();
-
-                    ui.label("Rate limit:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.magnet_edit_rate_limit)
-                            .speed(0.001)
-                            .clamp_range(0.0001_f64..=99.999_f64)
-                            .fixed_decimals(4),
-                    );
-                    ui.label("A/s");
-                    ui.end_row();
-                });
-
-            // Set Limits button — wrapped in horizontal so it never stretches full column width
-            cols[1].horizontal(|ui| {
-                let set_btn = egui::Button::new(egui::RichText::new("Set Limits").strong())
-                    .fill(egui::Color32::from_rgb(80, 120, 60));
-                if ui.add(set_btn).clicked() {
-                    let c = self.magnet_edit_current_limit;
-                    let v = self.magnet_edit_voltage_limit;
-                    let r = self.magnet_edit_rate_limit;
-                    match self.lakeshore_625.set_limits(c, v, r) {
-                        Ok(()) => {
-                            self.lakeshore_625.get_limits();
-                            if self.lakeshore_625.error_message.is_none() {
-                                let output = self.lakeshore_625.output.clone();
-                                self.magnet_limits = output.clone();
-                                if let Some((pc, pv, pr)) = parse_limits_from_output(&output) {
-                                    self.magnet_edit_current_limit = pc;
-                                    self.magnet_edit_voltage_limit = pv;
-                                    self.magnet_edit_rate_limit = pr;
-                                }
-                            }
-                            self.last_magnet_limits_update = Instant::now();
-                            self.magnet_limits_set_msg = Some(Ok(()));
-                        }
-                        Err(e) => self.magnet_limits_set_msg = Some(Err(e)),
-                    }
+        // ── Ramp parameters ───────────────────────────────────────
+        egui::Grid::new("adr_ramp_params_grid")
+            .num_columns(6)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Target current:");
+                ui.add(
+                    egui::DragValue::new(&mut self.adr_ramp_current)
+                        .speed(0.01)
+                        .clamp_range(0.0_f64..=60.0_f64)
+                        .fixed_decimals(2)
+                        .suffix(" A"),
+                );
+                ui.label("Ramp rate:");
+                ui.add(
+                    egui::DragValue::new(&mut self.adr_ramp_rate)
+                        .speed(0.0001)
+                        .clamp_range(0.0001_f64..=0.0055_f64)
+                        .fixed_decimals(4)
+                        .suffix(" A/s"),
+                );
+                ui.label("Soak duration:");
+                let mut soak = self.adr_ramp_soak_mins as f64;
+                if ui.add(
+                    egui::DragValue::new(&mut soak)
+                        .speed(1.0)
+                        .clamp_range(1.0_f64..=480.0_f64)
+                        .fixed_decimals(0)
+                        .suffix(" min"),
+                ).changed() {
+                    self.adr_ramp_soak_mins = soak as u64;
                 }
-                if let Some(ref msg) = self.magnet_limits_set_msg.clone() {
-                    match msg {
-                        Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Limits updated."); }
-                        Err(e) => { ui.colored_label(egui::Color32::RED, format!("Error: {}", e)); }
-                    }
-                }
+                ui.end_row();
             });
 
-            // Quench status printout
-            if !self.magnet_quench_status.is_empty() {
-                cols[1].add_space(4.0);
-                for line in self.magnet_quench_status.lines() {
-                    cols[1].label(line);
-                }
-            }
-        });
-
-        ui.add_space(4.0);
-        if !self.magnet_limits.is_empty() && !self.magnet_limits.starts_with("Error:") {
-            ui.label(format!(
-                "Last updated: {:.1}s ago  (refreshes every 30 s)",
-                self.last_magnet_limits_update.elapsed().as_secs_f32()
-            ));
-        }
+        // ── Compliance voltage & Limits (commented out, re-enable if needed) ──
+        // ui.add_space(8.0);
+        // ui.columns(2, |cols| {
+        //     // ── Left column: Compliance voltage ──────────────────
+        //     cols[0].strong("Compliance");
+        //     cols[0].add_space(4.0);
+        //     egui::Grid::new("magnet_ramp_grid")
+        //         .num_columns(4)
+        //         .spacing([8.0, 6.0])
+        //         .show(&mut cols[0], |ui| {
+        //             ui.label("Compliance V:");
+        //             ui.add(
+        //                 egui::DragValue::new(&mut self.magnet_edit_compliance_voltage)
+        //                     .speed(0.01)
+        //                     .clamp_range(0.1_f64..=5.0_f64)
+        //                     .fixed_decimals(2),
+        //             );
+        //             ui.label("V");
+        //             let comp_btn = egui::Button::new(egui::RichText::new("Set Compliance").strong())
+        //                 .fill(egui::Color32::from_rgb(80, 120, 60));
+        //             if ui.add(comp_btn).clicked() {
+        //                 let v = self.magnet_edit_compliance_voltage;
+        //                 self.magnet_compliance_set_msg = None;
+        //                 self.worker.send(GuiCommand::SetMagnetCompliance { voltage: v });
+        //             }
+        //             ui.end_row();
+        //             ui.label("");
+        //             if let Some(ref msg) = self.magnet_compliance_set_msg.clone() {
+        //                 match msg {
+        //                     Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Compliance set."); }
+        //                     Err(e) => { ui.colored_label(egui::Color32::RED, e.as_str()); }
+        //                 }
+        //             }
+        //             ui.end_row();
+        //         });
+        //     // ── Right column: Limits ─────────────────────────────
+        //     cols[1].strong("Limits (LIMIT?)");
+        //     if snap.magnet_limits.starts_with("Error:") {
+        //         cols[1].colored_label(egui::Color32::RED, &snap.magnet_limits.clone());
+        //     } else if snap.magnet_limits.is_empty() {
+        //         cols[1].label("(pending first poll…)");
+        //     }
+        //     egui::Grid::new("magnet_limits_grid")
+        //         .num_columns(3)
+        //         .spacing([8.0, 4.0])
+        //         .show(&mut cols[1], |ui| {
+        //             ui.label("Current limit:");
+        //             ui.add(
+        //                 egui::DragValue::new(&mut self.magnet_edit_current_limit)
+        //                     .speed(0.1)
+        //                     .clamp_range(0.0_f64..=60.1_f64)
+        //                     .fixed_decimals(2),
+        //             );
+        //             ui.label("A");
+        //             ui.end_row();
+        //             ui.label("Voltage limit:");
+        //             ui.add(
+        //                 egui::DragValue::new(&mut self.magnet_edit_voltage_limit)
+        //                     .speed(0.01)
+        //                     .clamp_range(0.1_f64..=5.0_f64)
+        //                     .fixed_decimals(2),
+        //             );
+        //             ui.label("V");
+        //             ui.end_row();
+        //             ui.label("Rate limit:");
+        //             ui.add(
+        //                 egui::DragValue::new(&mut self.magnet_edit_rate_limit)
+        //                     .speed(0.001)
+        //                     .clamp_range(0.0001_f64..=99.999_f64)
+        //                     .fixed_decimals(4),
+        //             );
+        //             ui.label("A/s");
+        //             ui.end_row();
+        //         });
+        //     cols[1].horizontal(|ui| {
+        //         let set_btn = egui::Button::new(egui::RichText::new("Set Limits").strong())
+        //             .fill(egui::Color32::from_rgb(80, 120, 60));
+        //         if ui.add(set_btn).clicked() {
+        //             let c = self.magnet_edit_current_limit;
+        //             let v = self.magnet_edit_voltage_limit;
+        //             let r = self.magnet_edit_rate_limit;
+        //             self.magnet_limits_set_msg = None;
+        //             self.worker.send(GuiCommand::SetMagnetLimits { current: c, voltage: v, rate: r });
+        //         }
+        //         if let Some(ref msg) = self.magnet_limits_set_msg.clone() {
+        //             match msg {
+        //                 Ok(()) => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ Limits updated."); }
+        //                 Err(e) => { ui.colored_label(egui::Color32::RED, format!("Error: {e}")); }
+        //             }
+        //         }
+        //     });
+        //     if !snap.magnet_quench.is_empty() {
+        //         cols[1].add_space(4.0);
+        //         for line in snap.magnet_quench.lines() {
+        //             cols[1].label(line);
+        //         }
+        //     }
+        // });
+        // ui.add_space(4.0);
+        // if let Some(t) = snap.last_magnet_update {
+        //     if !snap.magnet_limits.is_empty() && !snap.magnet_limits.starts_with("Error:") {
+        //         ui.label(format!(
+        //             "Last updated: {:.1}s ago  (refreshes every 30 s)",
+        //             t.elapsed().as_secs_f32()
+        //         ));
+        //     }
+        // }
     }
 
-    /// Poll MOUT?/HTR?/AOUT? for LS350 outputs 1–4 every 30 s.
-    fn update_gl7_if_needed(&mut self) {
-        if self.last_gl7_update.elapsed() >= Duration::from_secs(30)
-            && Instant::now() >= self.serial_gate
-        {
-            // 4 outputs × 2 commands × 200 ms → reserve 4 s on the gate
-            self.serial_gate = Instant::now() + Duration::from_secs(4);
-            for (i, output_num) in [1u8, 2, 3, 4].iter().enumerate() {
-                self.lakeshore_350.query_output_percentages(*output_num);
-                if self.lakeshore_350.error_message.is_none() {
-                    let mut lines = self.lakeshore_350.output.lines();
-                    let l1 = lines.next().unwrap_or("").to_string();
-                    let l2 = lines.next().unwrap_or("").to_string();
-                    // Parse current MOUT% from the first line: "MOUT (Manual Output %) N: <val>"
-                    if let Some(val) = l1.split_whitespace().last().and_then(|s| s.parse::<f64>().ok()) {
-                        self.gl7_edit_pct[i] = val;
-                    }
-                    self.gl7_output_lines[i] = (l1, l2);
-                }
-            }
-            self.last_gl7_update = Instant::now();
-        }
-    }
-
-    /// Draw the GL7 Sorption Cooler section.
-    fn show_gl7_section(&mut self, ui: &mut egui::Ui) {
+    fn show_gl7_section(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
         ui.add(
             egui::Label::new(
                 egui::RichText::new("GL7 Sorption Cooler")
@@ -802,7 +787,7 @@ impl FrostApp {
         );
         ui.add_space(6.0);
 
-        let lines = self.gl7_output_lines.clone();
+        let lines = snap.gl7_output_lines.clone();
         let output_names = ["4-Pump Heater", "3-Pump Heater", "4-Switch Heater", "3-Switch Heater"];
 
         ui.horizontal_wrapped(|ui| {
@@ -819,9 +804,7 @@ impl FrostApp {
                         ui.set_min_width(220.0);
                         ui.vertical(|ui| {
                             ui.add(egui::Label::new(
-                                egui::RichText::new(label)
-                                    .strong()
-                                    .size(14.0),
+                                egui::RichText::new(label).strong().size(14.0),
                             ).selectable(false));
                             ui.add(egui::Label::new(
                                 egui::RichText::new(format!("LS350 · Output {output_num}"))
@@ -847,7 +830,7 @@ impl FrostApp {
                                 }
                             }
                             ui.add_space(6.0);
-                            // ── Set output control ───────────────────────
+
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::DragValue::new(&mut self.gl7_edit_pct[i])
@@ -863,25 +846,8 @@ impl FrostApp {
                                 if ui.add(set_btn).clicked() {
                                     let pct = self.gl7_edit_pct[i];
                                     let out_num = output_num as u8;
-                                    self.lakeshore_350.set_output_percent(out_num, pct);
-                                    if self.lakeshore_350.error_message.is_some() {
-                                        self.gl7_set_msg[i] = Some(Err(
-                                            self.lakeshore_350.error_message.clone().unwrap()
-                                        ));
-                                    } else {
-                                        // Refresh this output's display
-                                        self.lakeshore_350.query_output_percentages(out_num);
-                                        if self.lakeshore_350.error_message.is_none() {
-                                            let mut ls = self.lakeshore_350.output.lines();
-                                            let nl1 = ls.next().unwrap_or("").to_string();
-                                            let nl2 = ls.next().unwrap_or("").to_string();
-                                            if let Some(v) = nl1.split_whitespace().last().and_then(|s| s.parse::<f64>().ok()) {
-                                                self.gl7_edit_pct[i] = v;
-                                            }
-                                            self.gl7_output_lines[i] = (nl1, nl2);
-                                        }
-                                        self.gl7_set_msg[i] = Some(Ok(()));
-                                    }
+                                    self.gl7_set_msg[i] = None;
+                                    self.worker.send(GuiCommand::SetGl7Output { output: out_num, pct });
                                 }
                             });
                             if let Some(ref msg) = self.gl7_set_msg[i].clone() {
@@ -896,232 +862,17 @@ impl FrostApp {
         });
 
         ui.add_space(4.0);
-        ui.label(format!(
-            "Last updated: {:.1}s ago  (refreshes every 30 s)",
-            self.last_gl7_update.elapsed().as_secs_f32()
-        ));
-    }
-
-    /// Update temperature readings every 30 seconds
-    fn update_temperatures_if_needed(&mut self) {
-        if self.last_temp_update.elapsed() >= Duration::from_secs(30)
-            && Instant::now() >= self.serial_gate
-        {
-            // 7 LS350 + 1 LS370 reads → reserve 5 s on the gate
-            self.serial_gate = Instant::now() + Duration::from_secs(5);
-            self.read_all_temperatures();
-            self.last_temp_update = Instant::now();
-        }
-    }
-
-    /// Read temperatures from both Lakeshore controllers
-    fn read_all_temperatures(&mut self) {
-        self.temperatures.error_message = None;
-
-        // Lakeshore 350 temperatures
-        // Input A (3-head) - uses calibration
-        self.temperatures.ls350_a = self.read_350_temperature_kelvin("A");
-        
-        // Input B (ADR) - uses KRDG?
-        self.temperatures.ls350_b = self.read_350_temperature_kelvin("B");
-        
-        // Input C (4-head) - uses calibration  
-        self.temperatures.ls350_c = self.read_350_temperature_kelvin("C");
-        
-        // Input D2 (Switch) - voltage sensor, converted to temperature
-        self.temperatures.ls350_d2 = self.read_350_temperature_kelvin("D2");
-        
-        // Input D3 (4K stage) - uses KRDG?
-        self.temperatures.ls350_d3 = self.read_350_temperature_kelvin("D3");
-        
-        // Input D4 (3-pump) - uses calibration
-        self.temperatures.ls350_d4 = self.read_350_temperature_kelvin("D4");
-        
-        // Input D5 (4-pump) - uses calibration
-        self.temperatures.ls350_d5 = self.read_350_temperature_kelvin("D5");
-
-        // Lakeshore 370 Input 1
-        self.temperatures.ls370_1 = self.read_370_temperature_kelvin(1);
-    }
-
-    /// Read temperature from Lakeshore 350 input using appropriate method
-    fn read_350_temperature_kelvin(&mut self, input: &str) -> String {
-        // Use the intelligent reading method for all inputs
-        let old_output = self.lakeshore_350.output.clone();
-        self.lakeshore_350.read_input_intelligent(input);
-        let result = self.extract_temperature_value(&self.lakeshore_350.output);
-        // Restore the original output to avoid side effects
-        self.lakeshore_350.output = old_output;
-        result
-    }
-
-    /// Read temperature from Lakeshore 370 input
-    fn read_370_temperature_kelvin(&self, input: u8) -> String {
-        match self.lakeshore_370.read_kelvin(input) {
-            Ok(k_str) => self.format_kelvin_value(&k_str),
-            Err(e) => format!("ERROR ({})", e)
-        }
-    }
-
-    /// Extract temperature value from output string
-    fn extract_temperature_value(&self, temp_str: &str) -> String {
-        if temp_str.contains("ERROR") {
-            return temp_str.to_string();
-        }
-        
-        // Look for pattern like "1.234 K" after the arrow
-        if let Some(arrow_pos) = temp_str.find("→") {
-            let after_arrow = &temp_str[arrow_pos + 3..]; // Skip "→ "
-            if let Some(k_pos) = after_arrow.find(" K") {
-                let temp_part = &after_arrow[..k_pos + 2]; // Include " K"
-                return temp_part.trim().to_string();
-            }
-        }
-        
-        // Look for pattern like ": 1.234 K" 
-        if let Some(colon_pos) = temp_str.rfind(":") {
-            let after_colon = &temp_str[colon_pos + 1..].trim();
-            if after_colon.ends_with(" K") {
-                return after_colon.to_string();
-            }
-        }
-        
-        // Fallback: return the whole string trimmed
-        temp_str.trim().to_string()
-    }
-
-    /// Format Kelvin value string into readable format
-    fn format_kelvin_value(&self, k_str: &str) -> String {
-        match k_str.parse::<f64>() {
-            Ok(k) if k > 0.0 => format!("{:.4} K", k),
-            Ok(_) => format!("{} (overload)", k_str),
-            Err(_) => k_str.to_string()
-        }
-    }
-
-    /// Poll compressor status every 30 seconds.
-    fn update_compressor_status_if_needed(&mut self) {
-        if self.last_compressor_update.elapsed() >= Duration::from_secs(30)
-            && Instant::now() >= self.serial_gate
-        {
-            // ~3 commands × 200 ms each → reserve 3 s on the gate
-            self.serial_gate = Instant::now() + Duration::from_secs(3);
-            self.compressor.get_status();
-            if let Some(e) = &self.compressor.error_message {
-                self.compressor_status = format!("Error: {}", e);
-            } else {
-                self.compressor_status = self.compressor.status_output.clone();
-                // Sync running state from the hardware response
-                self.compressor_running = self.compressor.status_output
-                    .lines()
-                    .any(|l| l.contains("Running:") && l.contains("Yes"));
-            }
-            self.last_compressor_update = Instant::now();
-        }
-    }
-
-    /// Draw the compressor start/stop button and status block.
-    fn show_compressor_section(&mut self, ui: &mut egui::Ui) {
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new("Compressor")
-                    .size(32.0)
-                    .strong()
-                    .color(egui::Color32::from_rgb(40, 40, 140)),
-            )
-            .selectable(false),
-        );
-        ui.add_space(6.0);
-
-        // ── Start / Stop button ──────────────────────────────────
-        ui.horizontal(|ui| {
-            if self.compressor_running {
-                let btn = egui::Button::new(
-                    egui::RichText::new("⏹  Stop Compressor").strong()
-                )
-                .fill(egui::Color32::from_rgb(180, 40, 40));
-                if ui.add(btn).clicked() {
-                    match self.compressor.stop_compressor() {
-                        Ok(()) => {
-                            self.compressor_running = false;
-                            self.compressor_error = None;
-                            // Immediately refresh status
-                            self.compressor.get_status();
-                            self.compressor_status = self.compressor.status_output.clone();
-                            self.last_compressor_update = Instant::now();
-                        }
-                        Err(e) => self.compressor_error = Some(e),
-                    }
-                }
-            } else {
-                let btn = egui::Button::new(
-                    egui::RichText::new("▶  Start Pulse Tube Cooldown").strong()
-                )
-                .fill(egui::Color32::from_rgb(30, 120, 60));
-                if ui.add(btn).clicked() {
-                    match self.compressor.start_compressor() {
-                        Ok(()) => {
-                            self.compressor_running = true;
-                            self.compressor_error = None;
-                            // Immediately refresh status
-                            self.compressor.get_status();
-                            self.compressor_status = self.compressor.status_output.clone();
-                            self.last_compressor_update = Instant::now();
-                        }
-                        Err(e) => self.compressor_error = Some(e),
-                    }
-                }
-            }
-        });
-
-        // Error line
-        if let Some(ref e) = self.compressor_error {
-            ui.colored_label(egui::Color32::RED, format!("Compressor error: {}", e));
-        }
-
-        ui.add_space(6.0);
-
-        // ── Status block ─────────────────────────────────────────
-        if !self.compressor_status.is_empty() {
-            for line in self.compressor_status.lines() {
-                if line.starts_with("Runtime:") {
-                    continue; // omit runtime line
-                } else if line.starts_with("Running:") {
-                    let is_yes = line.contains("Yes");
-                    let color = if is_yes {
-                        egui::Color32::from_rgb(20, 140, 20)
-                    } else {
-                        egui::Color32::from_rgb(160, 30, 30)
-                    };
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(line).strong().size(22.0).color(color),
-                    ).selectable(false));
-                } else if line.starts_with("Errors/Warnings:") {
-                    let has_errors = line.contains("Yes");
-                    let color = if has_errors {
-                        egui::Color32::from_rgb(200, 80, 0)
-                    } else {
-                        egui::Color32::DARK_GREEN
-                    };
-                    ui.add(egui::Label::new(
-                        egui::RichText::new(line).strong().size(18.0).color(color),
-                    ).selectable(false));
-                } else {
-                    ui.label(line);
-                }
-            }
+        if let Some(t) = snap.last_gl7_update {
             ui.label(format!(
                 "Last updated: {:.1}s ago  (refreshes every 30 s)",
-                self.last_compressor_update.elapsed().as_secs_f32()
+                t.elapsed().as_secs_f32()
             ));
         } else {
-            ui.label("Compressor status: (pending first poll…)");
+            ui.label("(pending first poll…)");
         }
     }
 
-    /// Display temperature readings and a Record Temps button in the GUI.
-    fn show_temperature_display(&mut self, ui: &mut egui::Ui) {
-        // ── Record Temperatures button (toggles start / stop) ────
+    fn show_temperature_display(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
         let is_recording = self.recording_stop_flag
             .as_ref()
             .map(|f| !f.load(Ordering::Relaxed))
@@ -1132,7 +883,6 @@ impl FrostApp {
             ui.add_space(12.0);
 
             if is_recording {
-                // ── STOP button ──────────────────────────────────
                 let btn = egui::Button::new(
                     egui::RichText::new("⏹  Stop Recording Temperatures").strong()
                 )
@@ -1149,7 +899,6 @@ impl FrostApp {
                     ));
                 }
             } else {
-                // ── START button ─────────────────────────────────
                 let btn = egui::Button::new(
                     egui::RichText::new("⏺  Record Temperatures").strong()
                 )
@@ -1159,9 +908,7 @@ impl FrostApp {
                         Ok((path, flag)) => {
                             self.recording_csv_path = Some(path.clone());
                             self.recording_stop_flag = Some(flag);
-                            self.record_result = Some(Ok(
-                                format!("Recording to: {}", path)
-                            ));
+                            self.record_result = Some(Ok(format!("Recording to: {path}")));
                         }
                         Err(e) => {
                             self.record_result = Some(Err(e));
@@ -1171,51 +918,35 @@ impl FrostApp {
             }
         });
 
-
-        // ── Record result status line ────────────────────────────
         if let Some(ref res) = self.record_result {
             match res {
                 Ok(msg)  => { ui.colored_label(egui::Color32::DARK_GREEN, msg); }
-                Err(err) => { ui.colored_label(egui::Color32::RED, format!("Record error: {}", err)); }
+                Err(err) => { ui.colored_label(egui::Color32::RED, format!("Record error: {err}")); }
             }
         }
 
         ui.add_space(6.0);
 
-        if let Some(ref error) = self.temperatures.error_message {
-            ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
-            ui.add_space(4.0);
-        }
-
-        // Collect values before closures to avoid borrow conflicts
-        let d3    = self.temperatures.ls350_d3.clone();
-        let adr   = self.temperatures.ls350_b.clone();
-        let d2    = self.temperatures.ls350_d2.clone();
-        let head3 = self.temperatures.ls350_a.clone();
-        let head4 = self.temperatures.ls350_c.clone();
-        let pump3 = self.temperatures.ls350_d4.clone();
-        let pump4 = self.temperatures.ls350_d5.clone();
-        let ls370 = self.temperatures.ls370_1.clone();
-        let adr_temp = adr.split('\u{2192}').nth(1)
+        let t   = &snap.temperatures;
+        let adr_temp = t.ls350_b.split('\u{2192}').nth(1)
             .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| adr.clone());
-        let elapsed = self.last_temp_update.elapsed().as_secs_f32();
+            .unwrap_or_else(|| t.ls350_b.clone());
+        let elapsed = snap.last_temp_update.map(|t| t.elapsed().as_secs_f32());
 
-        // ── Sensor cards ─────────────────────────────────────────
-        let sensors_350: &[(&str, &str, &str)] = &[
-            ("4K Stage", "LS350 · D3", &d3),
+        let sensors: &[(&str, &str, &str)] = &[
+            ("4K Stage",     "LS350 · D3",  &t.ls350_d3),
             ("ADR",          "LS350 · B",   &adr_temp),
-            ("Switch",       "LS350 · D2",  &d2),
-            ("3-Head",       "LS350 · A",   &head3),
-            ("4-Head",       "LS350 · C",   &head4),
-            ("3-Pump",       "LS350 · D4",  &pump3),
-            ("4-Pump",       "LS350 · D5",  &pump4),
-            ("Device Stage", "LS370 · In1", &ls370),
+            ("Switch",       "LS350 · D2",  &t.ls350_d2),
+            ("3-Head",       "LS350 · A",   &t.ls350_a),
+            ("4-Head",       "LS350 · C",   &t.ls350_c),
+            ("3-Pump",       "LS350 · D4",  &t.ls350_d4),
+            ("4-Pump",       "LS350 · D5",  &t.ls350_d5),
+            ("Device Stage", "LS370 · In1", &t.ls370_1),
         ];
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            for &(name, id, val) in sensors_350 {
+            for &(name, id, val) in sensors {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(218, 230, 255))
                     .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 130, 200)))
@@ -1241,42 +972,12 @@ impl FrostApp {
             }
         });
 
-
         ui.add_space(8.0);
-        ui.label(format!("Last updated: {:.1}s ago", elapsed));
-        ui.label("Updates every 30 seconds");
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────
-
-/// Extracts a single f64 from strings like:
-///   "Set current: 9.44 A"  →  9.44
-///   "Ramp rate: 0.0100 A/s"  →  0.01
-///   "Compliance voltage: 1.0 V"  →  1.0
-/// (always the third whitespace-separated token)
-fn parse_single_value(output: &str) -> Option<f64> {
-    output.split_whitespace().nth(2)?.parse().ok()
-}
-
-/// Parse the formatted output of `get_limits()` into (current, voltage, rate).
-/// Expected format:
-///   "Current limit: X A\nVoltage limit: Y V\nRate limit:    Z A/s"
-fn parse_limits_from_output(output: &str) -> Option<(f64, f64, f64)> {
-    let mut current = None;
-    let mut voltage = None;
-    let mut rate = None;
-    for line in output.lines() {
-        let mut parts = line.split_whitespace();
-        match parts.next() {
-            Some("Current") => { current = parts.nth(1).and_then(|s| s.parse().ok()); }
-            Some("Voltage") => { voltage = parts.nth(1).and_then(|s| s.parse().ok()); }
-            Some("Rate")    => { rate    = parts.nth(1).and_then(|s| s.parse().ok()); }
-            _ => {}
+        if let Some(e) = elapsed {
+            ui.label(format!("Last updated: {e:.1}s ago"));
+        } else {
+            ui.label("(pending first poll…)");
         }
-    }
-    match (current, voltage, rate) {
-        (Some(c), Some(v), Some(r)) => Some((c, v, r)),
-        _ => None,
+        ui.label("Updates every 30 seconds");
     }
 }

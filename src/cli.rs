@@ -1,6 +1,7 @@
 // cli.rs — FROST command-line interface
 //
 //   frost gui
+//   frost adr [OPTIONS] <rate> <current>
 //   frost compressor [--port /dev/ttyUSB3] <command>
 //   frost heatswitch [--port /dev/ttyUSB4] <command>
 //   frost lakeshore625 [--port /dev/ttyUSB0] <command>
@@ -23,15 +24,21 @@ use crate::lakeshore350::LakeShore350Controller;
 #[command(about = "FROST — Fridge Remote Operations, Software, and Thermometry")]
 #[command(version)]
 #[command(propagate_version = true)]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
-    device: Device,
+    pub device: Device,
 }
 
 #[derive(Subcommand)]
-enum Device {
+pub enum Device {
     /// Launch the graphical user interface
     Gui,
+
+    /// Automated ADR operations
+    Adr {
+        #[command(subcommand)]
+        command: AdrCmd,
+    },
 
     /// Cryomech pulse tube compressor
     Compressor {
@@ -92,9 +99,32 @@ enum Device {
     },
 }
 
+// ── ADR subcommands ───────────────────────────────────────────
+#[derive(Subcommand)]
+pub enum AdrCmd {
+    /// Full ramp sequence: set rate → ramp up → soak → open heat switch → ramp to 0 A.
+    ///
+    /// Logging runs automatically in the background (CSV saved to ramps/).
+    ///
+    /// Example: frost adr ramp 0.05 8.0 --soak-mins 60
+    ///
+    /// Use --soak-mins to override the default 45-minute soak before demagnetising.
+    Ramp {
+        /// Ramp rate in A/s (LakeShore 625 RATE command)
+        rate: f64,
+        /// Target current in A (LakeShore 625 SETI command)
+        current: f64,
+        /// Soak duration in minutes at target current before opening heat switch and ramping down (default: 45)
+        #[arg(long, default_value = "45")]
+        soak_mins: u64,
+    },
+    /// Continuously log ramp data to a date-stamped CSV in ramps/ (one row/min, Ctrl+C to stop)
+    Logging,
+}
+
 // ── Compressor subcommands ────────────────────────────────────
 #[derive(Subcommand)]
-enum CompressorCmd {
+pub enum CompressorCmd {
     /// Get compressor status (running, runtime, errors)
     Status,
     /// Start the compressor
@@ -115,7 +145,7 @@ enum CompressorCmd {
 
 // ── Heat switch subcommands ───────────────────────────────────
 #[derive(Subcommand)]
-enum HeatswitchCmd {
+pub enum HeatswitchCmd {
     /// Get full motor status (position, limits, speed, device status)
     Status,
     /// Get current motor position (microsteps)
@@ -150,7 +180,7 @@ enum HeatswitchCmd {
 
 // ── LakeShore 625 subcommands ─────────────────────────────────
 #[derive(Subcommand)]
-enum Lakeshore625Cmd {
+pub enum Lakeshore625Cmd {
     /// Get device identification (*IDN?)
     Identify,
     /// Get current baud rate setting (BAUD?)
@@ -193,6 +223,9 @@ enum Lakeshore625Cmd {
     SetQuench { enable: u8, step_limit: f64 },
     /// Get and parse error status register (ERSTR?)
     ErrorStatus,
+    /// Log ramp data (rate, current, voltage, field, errors) to a date-stamped CSV in ramps/
+    /// One row per minute — press Ctrl+C to stop.
+    Logging,
     /// Send a raw command string and print the response
     Raw {
         #[arg(required = true, num_args = 1..)]
@@ -202,7 +235,7 @@ enum Lakeshore625Cmd {
 
 // ── LakeShore 370 subcommands ────────────────────────────────
 #[derive(Subcommand)]
-enum Lakeshore370Cmd {
+pub enum Lakeshore370Cmd {
     /// Get device identification (*IDN?)
     Identify,
     /// Get baud rate code (BAUD?)
@@ -284,7 +317,7 @@ enum Lakeshore370Cmd {
 
 // ── LakeShore 350 subcommands ────────────────────────────────
 #[derive(Subcommand)]
-enum Lakeshore350Cmd {
+pub enum Lakeshore350Cmd {
     /// Get device identification (*IDN?)
     Identify,
     /// Read sensor/temperature for one input: A, B, C, D1–D5 (intelligent reading)
@@ -335,7 +368,7 @@ enum Lakeshore350Cmd {
 
 // ── RecordTemps subcommands ───────────────────────────────────────
 #[derive(Subcommand)]
-enum RecordTempsCmd {
+pub enum RecordTempsCmd {
     /// Take a single temperature snapshot and append one row to today's CSV
     Snapshot,
     /// Record temperatures continuously (one row every N seconds) until Ctrl+C
@@ -388,6 +421,15 @@ pub fn run() -> Result<(), String> {
         Device::RecordTemps { command } => {
             run_record_temps(command)
         }
+        Device::Adr { command } => match command {
+            AdrCmd::Ramp { rate, current, soak_mins } => {
+                crate::adr_ramping::run_adr_ramp(rate, current, soak_mins, None)
+            }
+            AdrCmd::Logging => {
+                let ctrl = LakeShore625Controller::default();
+                ctrl.run_logging()
+            }
+        },
     }
 }
 
@@ -622,6 +664,7 @@ fn run_lakeshore625(ctrl: &mut LakeShore625Controller, cmd: Lakeshore625Cmd) -> 
             ctrl.get_error_status();
             print_ctrl(&ctrl.output, &ctrl.error_message)
         }
+        Lakeshore625Cmd::Logging => ctrl.run_logging(),
         Lakeshore625Cmd::Raw { command } => {
             let cmd_str = command.join(" ");
             ctrl.raw_command(&cmd_str);

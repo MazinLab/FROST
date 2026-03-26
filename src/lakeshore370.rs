@@ -8,10 +8,6 @@
 // Command terminator: \r\n
 // Response terminator: \r\n
 
-use serialport::{DataBits, Parity, StopBits};
-use std::io::{Read, Write};
-use std::time::Duration;
-
 // ── Default connection settings ───────────────────────────────
 const DEFAULT_PORT: &str = "/dev/ttyUSB1";
 const DEFAULT_BAUD: u32 = 9600;
@@ -47,26 +43,6 @@ pub struct LakeShore370Controller {
     pub error_message: Option<String>,
     /// General query output shown in the output panel.
     pub output: String,
-
-    // ── GUI input fields ──────────────────────────────────────
-    /// Selected input channel (1–16).
-    pub selected_input: u8,
-    /// Heater output percentage (0–100).
-    pub heater_output_pct: f64,
-    /// Heater range code (0–8).
-    pub heater_range: u8,
-    /// Resistance range mode (0=manual, 1=current excitation, 2=voltage excitation).
-    pub range_mode: u8,
-    /// Resistance range excitation level (1–22).
-    pub range_excitation: u8,
-    /// Resistance range code (1–22).
-    pub range_code: u8,
-    /// Resistance range autorange (0=off, 1=on).
-    pub range_autorange: u8,
-    /// Resistance range current source off flag (0=source on, 1=source off).
-    pub range_cs_off: u8,
-    /// Analog output channel (1 or 2).
-    pub analog_channel: u8,
 }
 
 impl Default for LakeShore370Controller {
@@ -76,90 +52,16 @@ impl Default for LakeShore370Controller {
             baud_rate: DEFAULT_BAUD,
             error_message: None,
             output: String::new(),
-            selected_input: 1,
-            heater_output_pct: 0.0,
-            heater_range: 0,
-            range_mode: 0,
-            range_excitation: 5,
-            range_code: 14,
-            range_autorange: 0,
-            range_cs_off: 0,
-            analog_channel: 1,
         }
     }
 }
 
 impl LakeShore370Controller {
-    // ── Serial connection ─────────────────────────────────────
-
-    /// Open a serial connection, send a command with CRLF, read back one line.
-    /// Returns the stripped response string, or an error message.
-    fn send_command(&self, command: &str) -> Result<String, String> {
-        let mut port = serialport::new(&self.port, self.baud_rate)
-            .data_bits(DataBits::Seven)
-            .parity(Parity::Odd)
-            .stop_bits(StopBits::One)
-            .timeout(Duration::from_millis(2000))
-            .open()
-            .map_err(|e| format!("Failed to open {}: {}", self.port, e))?;
-
-        // Clear stale input
-        port.clear(serialport::ClearBuffer::Input).ok();
-
-        // Send command + CRLF
-        port.write_all(format!("{}\r\n", command).as_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-
-        // 200 ms settling time (matches Python time.sleep(0.2))
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Read response until \n or timeout
-        let mut response = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match port.read(&mut byte) {
-                Ok(1) => {
-                    let c = byte[0] as char;
-                    if c == '\n' {
-                        break;
-                    } else if c != '\r' {
-                        response.push(c);
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        Ok(response.trim().to_string())
-    }
-
-    /// Send a write-only command (no response expected) with a longer settling time.
-    /// Used for RDGRNG, MOUT, HTRRNG, ANALOG, etc. (matches Python time.sleep(0.5)).
-    fn send_write_command(&self, command: &str) -> Result<(), String> {
-        let mut port = serialport::new(&self.port, self.baud_rate)
-            .data_bits(DataBits::Seven)
-            .parity(Parity::Odd)
-            .stop_bits(StopBits::One)
-            .timeout(Duration::from_millis(2000))
-            .open()
-            .map_err(|e| format!("Failed to open {}: {}", self.port, e))?;
-
-        port.clear(serialport::ClearBuffer::Input).ok();
-
-        port.write_all(format!("{}\r\n", command).as_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-
-        // 500 ms settling time for write commands
-        std::thread::sleep(Duration::from_millis(500));
-
-        Ok(())
-    }
-
     // ── Identity / info ───────────────────────────────────────
 
     /// `*IDN?` — device identification string.
     pub fn get_identification(&mut self) {
-        match self.send_command("*IDN?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "*IDN?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => { self.output = format!("ID: {r}"); self.error_message = None; }
             Ok(_) => self.error_message = Some("No response to *IDN?".to_string()),
             Err(e) => self.error_message = Some(e),
@@ -168,7 +70,7 @@ impl LakeShore370Controller {
 
     /// `BAUD?` — baud rate code (0=300, 1=1200, 2=9600).
     pub fn get_baud_rate(&mut self) {
-        match self.send_command("BAUD?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "BAUD?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 let readable = match r.as_str() {
                     "0" => "300",
@@ -189,7 +91,7 @@ impl LakeShore370Controller {
         if code > 2 {
             return Err(format!("Baud rate code must be 0 (300), 1 (1200), or 2 (9600), got {code}"));
         }
-        self.send_write_command(&format!("BAUD {code}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("BAUD {code}"), "\r\n", 500)?;
         Ok(())
     }
 
@@ -200,7 +102,7 @@ impl LakeShore370Controller {
         if !(INPUT_MIN..=INPUT_MAX).contains(&input) {
             return Err(format!("Input must be {INPUT_MIN}–{INPUT_MAX}, got {input}"));
         }
-        let r = self.send_command(&format!("RDGK? {input}"))?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGK? {input}"), "\r\n", 200)?;
         if r.is_empty() { return Err(format!("No response to RDGK? {input}")); }
         Ok(r)
     }
@@ -210,7 +112,7 @@ impl LakeShore370Controller {
         if !(INPUT_MIN..=INPUT_MAX).contains(&input) {
             return Err(format!("Input must be {INPUT_MIN}–{INPUT_MAX}, got {input}"));
         }
-        let r = self.send_command(&format!("RDGR? {input}"))?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGR? {input}"), "\r\n", 200)?;
         if r.is_empty() { return Err(format!("No response to RDGR? {input}")); }
         Ok(r)
     }
@@ -220,7 +122,7 @@ impl LakeShore370Controller {
         if !(INPUT_MIN..=INPUT_MAX).contains(&input) {
             return Err(format!("Input must be {INPUT_MIN}–{INPUT_MAX}, got {input}"));
         }
-        let r = self.send_command(&format!("RDGPWR? {input}"))?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGPWR? {input}"), "\r\n", 200)?;
         if r.is_empty() { return Err(format!("No response to RDGPWR? {input}")); }
         Ok(r)
     }
@@ -230,7 +132,7 @@ impl LakeShore370Controller {
         if !(INPUT_MIN..=INPUT_MAX).contains(&input) {
             return Err(format!("Input must be {INPUT_MIN}–{INPUT_MAX}, got {input}"));
         }
-        let r = self.send_command(&format!("RDGST? {input}"))?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGST? {input}"), "\r\n", 200)?;
         if r.is_empty() { return Err(format!("No response to RDGST? {input}")); }
         Ok(r)
     }
@@ -243,7 +145,7 @@ impl LakeShore370Controller {
         }
         let mut out = format!("Input {input}:\n");
 
-        match self.send_command(&format!("RDGK? {input}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGK? {input}"), "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 match r.parse::<f64>() {
                     Ok(k) if k > 0.0 => out.push_str(&format!("  Temperature: {k:.4} K\n")),
@@ -255,7 +157,7 @@ impl LakeShore370Controller {
             Err(e) => out.push_str(&format!("  Temperature: ERROR ({e})\n")),
         }
 
-        match self.send_command(&format!("RDGR? {input}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGR? {input}"), "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 match r.parse::<f64>() {
                     Ok(ohms) if ohms >= 0.0 => out.push_str(&format!("  Resistance:  {ohms:.4} Ω\n")),
@@ -267,7 +169,7 @@ impl LakeShore370Controller {
             Err(e) => out.push_str(&format!("  Resistance:  ERROR ({e})\n")),
         }
 
-        match self.send_command(&format!("RDGPWR? {input}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGPWR? {input}"), "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 match r.parse::<f64>() {
                     Ok(w)  => out.push_str(&format!("  Power:       {}\n", format_power(w))),
@@ -290,7 +192,7 @@ impl LakeShore370Controller {
             self.error_message = Some(format!("Input must be {INPUT_MIN}–{INPUT_MAX}"));
             return;
         }
-        match self.send_command(&format!("RDGRNG? {input}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("RDGRNG? {input}"), "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 self.output = parse_resistance_range(&r, input);
                 self.error_message = None;
@@ -334,9 +236,9 @@ impl LakeShore370Controller {
         if cs_off > 1 {
             return Err(format!("cs_off must be 0 (source on) or 1 (source off), got {cs_off}"));
         }
-        self.send_write_command(&format!(
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!(
             "RDGRNG {input},{mode},{excitation},{range},{autorange},{cs_off}"
-        ))?;
+        ), "\r\n", 500)?;
         Ok(())
     }
 
@@ -344,7 +246,7 @@ impl LakeShore370Controller {
 
     /// `HTR?` — get heater output percentage into `output`.
     pub fn get_heater_output(&mut self) {
-        match self.send_command("HTR?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "HTR?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 match r.parse::<f64>() {
                     Ok(pct) => { self.output = format!("Heater output: {pct:.3}%"); }
@@ -362,7 +264,7 @@ impl LakeShore370Controller {
         if !(0.0..=100.0).contains(&percent) {
             return Err(format!("Heater output must be 0.0–100.0%, got {percent}"));
         }
-        self.send_write_command(&format!("MOUT {percent:.3}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("MOUT {percent:.3}"), "\r\n", 500)?;
         Ok(())
     }
 
@@ -370,7 +272,7 @@ impl LakeShore370Controller {
 
     /// `HTRRNG?` — get heater range into `output`.
     pub fn get_heater_range(&mut self) {
-        match self.send_command("HTRRNG?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "HTRRNG?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 let code = r.parse::<usize>().unwrap_or(usize::MAX);
                 let name = HEATER_RANGE_NAMES.get(code).copied().unwrap_or("Unknown");
@@ -387,7 +289,7 @@ impl LakeShore370Controller {
         if range > HEATER_RANGE_MAX {
             return Err(format!("Heater range must be 0–{HEATER_RANGE_MAX}, got {range}"));
         }
-        self.send_write_command(&format!("HTRRNG {range}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("HTRRNG {range}"), "\r\n", 500)?;
         Ok(())
     }
 
@@ -395,7 +297,7 @@ impl LakeShore370Controller {
 
     /// `HTRST?` — get heater status into `output`.
     pub fn get_heater_status(&mut self) {
-        match self.send_command("HTRST?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "HTRST?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 let code = r.parse::<u32>().unwrap_or(0);
                 self.output = format!("Heater status: {code} (0x{code:02X})");
@@ -414,7 +316,7 @@ impl LakeShore370Controller {
             self.error_message = Some("Analog channel must be 1 or 2".to_string());
             return;
         }
-        match self.send_command(&format!("ANALOG? {channel}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("ANALOG? {channel}"), "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 self.output = parse_analog_config(&r, channel);
                 self.error_message = None;
@@ -430,7 +332,7 @@ impl LakeShore370Controller {
             self.error_message = Some("Analog channel must be 1 or 2".to_string());
             return;
         }
-        match self.send_command(&format!("AOUT? {channel}")) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, &format!("AOUT? {channel}"), "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 match r.parse::<f64>() {
                     Ok(pct) => { self.output = format!("Analog output {channel}: {pct:.3}%"); }
@@ -448,7 +350,7 @@ impl LakeShore370Controller {
         if channel < 1 || channel > 2 {
             return Err("Analog channel must be 1 or 2".to_string());
         }
-        self.send_write_command(&format!("ANALOG {channel},0,0,0,0,0,0,0"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("ANALOG {channel},0,0,0,0,0,0,0"), "\r\n", 500)?;
         Ok(())
     }
 
@@ -479,9 +381,9 @@ impl LakeShore370Controller {
         if data_source < 1 || data_source > 3 {
             return Err("Data source must be 1 (Kelvin), 2 (Ohms), or 3 (Linear Data)".to_string());
         }
-        self.send_write_command(&format!(
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!(
             "ANALOG {channel},{polarity},1,{input},{data_source},{high_value},{low_value},0"
-        ))?;
+        ), "\r\n", 500)?;
         Ok(())
     }
 
@@ -498,9 +400,9 @@ impl LakeShore370Controller {
         if polarity > 1 {
             return Err("Polarity must be 0 (unipolar) or 1 (bipolar)".to_string());
         }
-        self.send_write_command(&format!(
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!(
             "ANALOG {channel},{polarity},2,0,0,0,0,{manual_value}"
-        ))?;
+        ), "\r\n", 500)?;
         Ok(())
     }
 
@@ -509,7 +411,7 @@ impl LakeShore370Controller {
         if polarity > 1 {
             return Err("Polarity must be 0 (unipolar) or 1 (bipolar)".to_string());
         }
-        self.send_write_command(&format!("ANALOG 2,{polarity},4,0,0,0,0,0"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("ANALOG 2,{polarity},4,0,0,0,0,0"), "\r\n", 500)?;
         Ok(())
     }
 
@@ -517,7 +419,7 @@ impl LakeShore370Controller {
 
     /// Send an arbitrary command string and put the response in `output`.
     pub fn raw_command(&mut self, command: &str) {
-        match self.send_command(command) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, command, "\r\n", 200) {
             Ok(r) => {
                 self.output = format!(
                     ">> {command}\n{}",

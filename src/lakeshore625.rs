@@ -9,9 +9,8 @@
 // Response terminator: \n
 
 use chrono::Local;
-use serialport::{DataBits, Parity, StopBits};
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
@@ -36,22 +35,6 @@ pub struct LakeShore625Controller {
     pub error_message: Option<String>,
     /// General query output shown in the output panel.
     pub output: String,
-
-    // ── GUI input fields (for ADR tab controls) ───────────────
-    /// Target current for SETI (A).
-    pub target_current: f64,
-    /// Ramp rate for RATE (A/s).
-    pub ramp_rate: f64,
-    /// Compliance voltage for SETV (V).
-    pub compliance_voltage: f64,
-    /// Max current limit for LIMIT (A).
-    pub current_limit: f64,
-    /// Max voltage limit for LIMIT (V).
-    pub voltage_limit: f64,
-    /// Max rate limit for LIMIT (A/s).
-    pub rate_limit: f64,
-    /// Quench step limit for QNCH (A/s).
-    pub quench_step_limit: f64,
 }
 
 impl Default for LakeShore625Controller {
@@ -61,65 +44,16 @@ impl Default for LakeShore625Controller {
             baud_rate: DEFAULT_BAUD,
             error_message: None,
             output: String::new(),
-            target_current: 0.0,
-            ramp_rate: 0.01,
-            compliance_voltage: 1.0,
-            current_limit: 10.0,
-            voltage_limit: 1.0,
-            rate_limit: 0.1,
-            quench_step_limit: 0.05,
         }
     }
 }
 
 impl LakeShore625Controller {
-    // ── Serial connection ────────────────────────────────────
-    /// Open a serial connection, send a command with CRLF, read back one line.
-    /// Returns the stripped response string, or an error message.
-    fn send_command(&self, command: &str) -> Result<String, String> {
-        let mut port = serialport::new(&self.port, self.baud_rate)
-            .data_bits(DataBits::Seven)
-            .parity(Parity::Odd)
-            .stop_bits(StopBits::One)
-            .timeout(Duration::from_millis(2000))
-            .open()
-            .map_err(|e| format!("Failed to open {}: {}", self.port, e))?;
-
-        // Clear stale input
-        port.clear(serialport::ClearBuffer::Input).ok();
-
-        // Send command + CRLF
-        port.write_all(format!("{}\r\n", command).as_bytes())
-            .map_err(|e| format!("Write error: {e}"))?;
-
-        // 200 ms settling time (matches Python time.sleep(0.2))
-        std::thread::sleep(Duration::from_millis(200));
-
-        // Read response until \n or timeout
-        let mut response = String::new();
-        let mut byte = [0u8; 1];
-        loop {
-            match port.read(&mut byte) {
-                Ok(1) => {
-                    let c = byte[0] as char;
-                    if c == '\n' {
-                        break;
-                    } else if c != '\r' {
-                        response.push(c);
-                    }
-                }
-                _ => break,
-            }
-        }
-
-        Ok(response.trim().to_string())
-    }
-
     // ── Identity / info ──────────────────────────────────────
 
     /// `*IDN?` — device identification string.
     pub fn get_identification(&mut self) {
-        match self.send_command("*IDN?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "*IDN?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => { self.output = format!("ID: {r}"); self.error_message = None; }
             Ok(_) => self.error_message = Some("No response to *IDN?".to_string()),
             Err(e) => self.error_message = Some(e),
@@ -128,7 +62,7 @@ impl LakeShore625Controller {
 
     /// `BAUD?` — baud rate code (0=9600, 1=19200, 2=38400, 3=57600).
     pub fn get_baud_rate(&mut self) {
-        match self.send_command("BAUD?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "BAUD?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 let readable = match r.as_str() {
                     "0" => "9600",
@@ -149,21 +83,21 @@ impl LakeShore625Controller {
 
     /// `RDGF?` — magnetic field in Tesla.
     pub fn get_field(&mut self) -> Result<String, String> {
-        let r = self.send_command("RDGF?")?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, "RDGF?", "\r\n", 200)?;
         if r.is_empty() { return Err("No response to RDGF?".to_string()); }
         Ok(r)
     }
 
     /// `RDGI?` — output current in Amps.
     pub fn get_current(&mut self) -> Result<String, String> {
-        let r = self.send_command("RDGI?")?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, "RDGI?", "\r\n", 200)?;
         if r.is_empty() { return Err("No response to RDGI?".to_string()); }
         Ok(r)
     }
 
     /// `RDGV?` — output voltage in Volts.
     pub fn get_voltage(&mut self) -> Result<String, String> {
-        let r = self.send_command("RDGV?")?;
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, "RDGV?", "\r\n", 200)?;
         if r.is_empty() { return Err("No response to RDGV?".to_string()); }
         Ok(r)
     }
@@ -171,17 +105,17 @@ impl LakeShore625Controller {
     /// Read field, current, and voltage into `output`.
     pub fn get_all_readings(&mut self) {
         let mut out = String::new();
-        match self.send_command("RDGF?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "RDGF?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => out.push_str(&format!("Field:   {} T\n", r)),
             Ok(_)  => out.push_str("Field:   NO_RESPONSE\n"),
             Err(e) => out.push_str(&format!("Field:   ERROR ({})\n", e)),
         }
-        match self.send_command("RDGI?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "RDGI?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => out.push_str(&format!("Current: {} A\n", r)),
             Ok(_)  => out.push_str("Current: NO_RESPONSE\n"),
             Err(e) => out.push_str(&format!("Current: ERROR ({})\n", e)),
         }
-        match self.send_command("RDGV?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "RDGV?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => out.push_str(&format!("Voltage: {} V\n", r)),
             Ok(_)  => out.push_str("Voltage: NO_RESPONSE\n"),
             Err(e) => out.push_str(&format!("Voltage: ERROR ({})\n", e)),
@@ -194,13 +128,13 @@ impl LakeShore625Controller {
 
     /// `SETI <current>` — set target output current (A).
     pub fn set_current(&mut self, current: f64) -> Result<(), String> {
-        self.send_command(&format!("SETI {current}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("SETI {current}"), "\r\n", 200)?;
         Ok(())
     }
 
     /// `SETI?` — get the programmed target current setpoint (A).
     pub fn get_set_current(&mut self) {
-        match self.send_command("SETI?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "SETI?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => { self.output = format!("Set current: {} A", r); self.error_message = None; }
             Ok(_) => self.error_message = Some("No response to SETI?".to_string()),
             Err(e) => self.error_message = Some(e),
@@ -211,7 +145,7 @@ impl LakeShore625Controller {
 
     /// `RATE?` — get current ramp rate (A/s) into `output`.
     pub fn get_ramp_rate(&mut self) {
-        match self.send_command("RATE?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "RATE?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => { self.output = format!("Ramp rate: {} A/s", r); self.error_message = None; }
             Ok(_) => self.error_message = Some("No response to RATE?".to_string()),
             Err(e) => self.error_message = Some(e),
@@ -220,7 +154,7 @@ impl LakeShore625Controller {
 
     /// `RATE <rate>` — set ramp rate (A/s).
     pub fn set_ramp_rate(&mut self, rate: f64) -> Result<(), String> {
-        self.send_command(&format!("RATE {rate}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("RATE {rate}"), "\r\n", 200)?;
         Ok(())
     }
 
@@ -228,13 +162,13 @@ impl LakeShore625Controller {
 
     /// `RAMP` — start current ramp.
     pub fn start_ramp(&mut self) -> Result<(), String> {
-        self.send_command("RAMP")?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, "RAMP", "\r\n", 200)?;
         Ok(())
     }
 
     /// `STOP` — stop / pause current ramp.
     pub fn stop_ramp(&mut self) -> Result<(), String> {
-        self.send_command("STOP")?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, "STOP", "\r\n", 200)?;
         Ok(())
     }
 
@@ -242,7 +176,7 @@ impl LakeShore625Controller {
 
     /// `SETV?` — get compliance voltage limit into `output`.
     pub fn get_compliance_voltage(&mut self) {
-        match self.send_command("SETV?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "SETV?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => { self.output = format!("Compliance voltage: {} V", r); self.error_message = None; }
             Ok(_) => self.error_message = Some("No response to SETV?".to_string()),
             Err(e) => self.error_message = Some(e),
@@ -254,7 +188,7 @@ impl LakeShore625Controller {
         if !(VOLTAGE_LIMIT_MIN..=VOLTAGE_LIMIT_MAX).contains(&voltage) {
             return Err(format!("Compliance voltage must be {VOLTAGE_LIMIT_MIN}–{VOLTAGE_LIMIT_MAX} V, got {voltage}"));
         }
-        self.send_command(&format!("SETV {voltage}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("SETV {voltage}"), "\r\n", 200)?;
         Ok(())
     }
 
@@ -262,7 +196,7 @@ impl LakeShore625Controller {
 
     /// `LIMIT?` — get all max limits into `output`.
     pub fn get_limits(&mut self) {
-        match self.send_command("LIMIT?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "LIMIT?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 let parts: Vec<&str> = r.splitn(3, ',').collect();
                 if parts.len() == 3 {
@@ -292,7 +226,7 @@ impl LakeShore625Controller {
         if !(RATE_LIMIT_MIN..=RATE_LIMIT_MAX).contains(&rate) {
             return Err(format!("Rate limit must be {RATE_LIMIT_MIN}–{RATE_LIMIT_MAX} A/s, got {rate}"));
         }
-        self.send_command(&format!("LIMIT {current}, {voltage}, {rate}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("LIMIT {current}, {voltage}, {rate}"), "\r\n", 200)?;
         Ok(())
     }
 
@@ -300,7 +234,7 @@ impl LakeShore625Controller {
 
     /// `QNCH?` — get quench detection status into `output`.
     pub fn get_quench_status(&mut self) {
-        match self.send_command("QNCH?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "QNCH?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 let parts: Vec<&str> = r.splitn(2, ',').collect();
                 if parts.len() == 2 {
@@ -322,19 +256,20 @@ impl LakeShore625Controller {
 
     /// `QNCH 1` / `QNCH 0` — enable or disable quench detection.
     pub fn set_quench_enable(&mut self, enable: bool) -> Result<(), String> {
-        self.send_command(&format!("QNCH {}", if enable { 1 } else { 0 }))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("QNCH {}", if enable { 1 } else { 0 }), "\r\n", 200)?;
         Ok(())
     }
 
     /// `QNCH 1,<step_limit>` — set quench step limit (A/s) while leaving enable state.
+    #[allow(dead_code)]
     pub fn set_quench_step_limit(&mut self, step_limit: f64) -> Result<(), String> {
-        self.send_command(&format!("QNCH 1,{step_limit}"))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("QNCH 1,{step_limit}"), "\r\n", 200)?;
         Ok(())
     }
 
     /// `QNCH <enable> <step_limit>` — set quench detection enable and step limit together.
     pub fn set_quench_detection(&mut self, enable: bool, step_limit: f64) -> Result<(), String> {
-        self.send_command(&format!("QNCH {} {step_limit}", if enable { 1 } else { 0 }))?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("QNCH {} {step_limit}", if enable { 1 } else { 0 }), "\r\n", 200)?;
         Ok(())
     }
 
@@ -343,7 +278,7 @@ impl LakeShore625Controller {
     /// `ERSTR?` — get and parse the error status register into `output`.
     /// Replicates the bit-field parsing from power_controller.py::get_error_status().
     pub fn get_error_status(&mut self) {
-        match self.send_command("ERSTR?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "ERSTR?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
                 self.output = parse_error_status(&r);
                 self.error_message = None;
@@ -357,7 +292,7 @@ impl LakeShore625Controller {
 
     /// Send an arbitrary command string and put the response in `output`.
     pub fn raw_command(&mut self, command: &str) {
-        match self.send_command(command) {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, command, "\r\n", 200) {
             Ok(r) => {
                 self.output = format!(">> {command}\n{}", if r.is_empty() { "(no response)" } else { &r });
                 self.error_message = None;
@@ -465,14 +400,14 @@ impl LakeShore625Controller {
 
     /// Parse a raw SCPI response to `f64`, stripping a leading `+`.
     fn read_f64(&self, cmd: &str) -> Option<f64> {
-        self.send_command(cmd).ok()
+        crate::serial::scpi_query(&self.port, self.baud_rate, cmd, "\r\n", 200).ok()
             .filter(|r| !r.is_empty())
             .and_then(|r| r.trim_start_matches('+').parse::<f64>().ok())
     }
 
     /// `ERSTR?` — compact semicolon-separated error string (or "None").
     fn read_error_compact(&self) -> String {
-        match self.send_command("ERSTR?") {
+        match crate::serial::scpi_query(&self.port, self.baud_rate, "ERSTR?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => parse_error_compact(&r),
             _ => "None".to_string(),
         }
@@ -482,7 +417,7 @@ impl LakeShore625Controller {
 // ── ERSTR? bit-field parser ───────────────────────────────────
 /// Parses `ERSTR?` response `"hw,op,psh"` into a human-readable string.
 /// Mirrors the logic in power_controller.py::get_error_status().
-fn parse_error_status(response: &str) -> String {
+pub fn parse_error_status(response: &str) -> String {
     let parts: Vec<&str> = response.splitn(3, ',').collect();
     if parts.len() != 3 {
         return format!("Raw error status: {response}");
@@ -539,10 +474,10 @@ const RAMP_HEADERS: &[&str] = &[
     "Timestamp", "Date", "Time", "Elapsed_Seconds",
     "Ramp_Rate_A_per_s", "Current_A", "Voltage_V", "Field_T", "Error_Status",
 ];
-const RAMP_WIDTHS: &[usize] = &[28, 12, 12, 16, 18, 14, 14, 14, 20];
+pub const RAMP_WIDTHS: &[usize] = &[28, 12, 12, 16, 18, 14, 14, 14, 20];
 
 /// Find the next available ramp log path (auto-increments `_1`, `_2`, …).
-fn next_ramp_csv(dir: &str, date: &str) -> String {
+pub fn next_ramp_csv(dir: &str, date: &str) -> String {
     let base = format!("{}/{}_ramp_log.csv", dir, date);
     if !Path::new(&base).exists() { return base; }
     let mut n = 1u32;
@@ -572,7 +507,7 @@ fn print_ramp_row(values: &[String]) {
 }
 
 /// Format an `Option<f64>` as `decimals`-place string, or `"NO_RESPONSE"`.
-fn fmt_ramp_f64_opt(v: Option<f64>, decimals: usize) -> String {
+pub fn fmt_ramp_f64_opt(v: Option<f64>, decimals: usize) -> String {
     match v {
         Some(x) => format!("{:.prec$}", x, prec = decimals),
         None    => "NO_RESPONSE".to_string(),
@@ -581,7 +516,7 @@ fn fmt_ramp_f64_opt(v: Option<f64>, decimals: usize) -> String {
 
 /// Serialize a row to a fixed-width string for the CSV.
 /// All columns are padded except the last — mirrors `append_to_formatted_csv` in logging.py.
-fn ramp_format_row(values: &[String]) -> String {
+pub fn ramp_format_row(values: &[String]) -> String {
     let last = values.len().saturating_sub(1);
     values.iter().enumerate()
         .map(|(i, v)| {
@@ -604,7 +539,7 @@ fn append_ramp_row(path: &str, line: &str) -> Result<(), String> {
 
 /// Parse `ERSTR?` response into a compact semicolon-separated error string.
 /// Mirrors `_parse_error_status` in logging.py.
-fn parse_error_compact(response: &str) -> String {
+pub fn parse_error_compact(response: &str) -> String {
     let parts: Vec<&str> = response.splitn(3, ',').collect();
     if parts.len() != 3 { return "Parse Error".to_string(); }
     let hw  = parts[0].trim().parse::<u32>().unwrap_or(0);
