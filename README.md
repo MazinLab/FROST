@@ -187,11 +187,11 @@ frost heatswitch reset           # Re-home
 frost heatswitch stop            # Stop motion
 frost heatswitch estop           # Emergency stop (3x STOP)
 frost heatswitch move-abs <pos>  # Move to absolute position (microsteps)
-frost heatswitch move-rel <steps># Move relative (microsteps)
+frost heatswitch move-rel <steps> # Move relative (microsteps)
 frost heatswitch cw <steps>      # Rotate clockwise
 frost heatswitch ccw <steps>     # Rotate counter-clockwise
 frost heatswitch safe-cw <steps> # Clamped CW move (1–1000 steps)
-frost heatswitch safe-ccw <steps># Clamped CCW move (1–1000 steps)
+frost heatswitch safe-ccw <steps> # Clamped CCW move (1–1000 steps)
 frost heatswitch move-vel <vel>  # Move at velocity
 ```
 
