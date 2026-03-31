@@ -181,7 +181,7 @@ frost compressor clear-min-max   # Reset min/max records
 frost heatswitch [--port PORT] [--baud BAUD] [--device-id ID] <command>
 
 frost heatswitch open            # Move +115200 microsteps (open position)
-frost heatswitch close           # Move -115200 microsteps (closed position)
+frost heatswitch close           # Move CCW until motor stalls against mechanical stop (blocking)
 frost heatswitch home            # Home the motor
 frost heatswitch reset           # Re-home
 frost heatswitch stop            # Stop motion
@@ -195,7 +195,7 @@ frost heatswitch safe-ccw <steps># Clamped CCW move (1–1000 steps)
 frost heatswitch move-vel <vel>  # Move at velocity
 ```
 
-Note: `open` and `close` return immediately — the motor executes asynchronously. Poll status separately to check completion.
+Note: `open` returns immediately — the motor executes asynchronously. Poll status separately to check completion. `close` is blocking: it moves CCW with 4× the standard travel (460800 steps) so the motor always reaches the mechanical stop regardless of starting position, then polls until the position stops changing (stall detected) or a 30-second timeout elapses, then sends STOP.
 
 ### `frost lakeshore625` — Magnet Power Supply
 
