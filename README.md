@@ -382,15 +382,20 @@ Phase 5: Running at base temperature  (~36 hours)
 
 **Phase 0 — Precondition check:** Verifies the system is in the expected cold state before starting. Checks 4K stage < 4.5K, both heat switches OFF (< 10K), both heads < 5K, both pumps < 10K.
 
-**Phase 1 — Ramp up:** Executes a fixed time-based ramp schedule (30%→50%→80% for Output 1, 30%→50%→60% for Output 2 over 90 seconds), then holds at 80%/60% until at least one pump reaches its Phase 2 minimum temperature. Exits to Phase 2 when either pump exceeds its minimum (4-pump: 50K, 3-pump: 45K), dropping that pump's output to its initial stabilization value. A pump that has not yet reached its minimum keeps its Phase 1 output level until it arrives.
+**Phase 1 — Ramp up:** Executes a fixed time-based ramp schedule (30%→50%→80% for Output 1, 30%→50%→60% for Output 2 over 90 seconds), then holds at 80%/60% and polls every 30 s. Once the 4-pump reaches 45K, Output 1 is stepped down by 8% per poll until it reaches 25%. Once the 3-pump reaches 42K, Output 2 is stepped down by 8% per poll until it reaches 18%. The two pumps step down independently. Phase 1 exits when both outputs have reached their floors (25% / 18%).
 
 **Phase 2 — Stabilize:** Holds 4-pump at 50–60K and 3-pump at 45–55K using a rate-limited feedback loop (adjustments at most once every 3 minutes per output). Uses rolling averages and dT/dt to avoid reacting to noise. Exits when the **4-head** plateaus below 5.45K, both pumps have been in range for 10+ continuous minutes, and the system has been settled for 5+ minutes. These exit conditions may be changed over time. Timeout exit available after 120 minutes if both heads are below 6.0K. 
 
-**Phase 3 — Cycle ⁴He:** Turns off 4-pump (Output 1 → 0%), opens 4-switch (Output 3 → 40%). Monitors 3-pump and increases Output 2 aggressively if it drops below 45K (up to 100% if needed — the switch opening creates a large thermal disturbance). Exits when both heads fall below 2.0K.
+**Phase 3 — Cycle ⁴He:** Turns off 4-pump (Output 1 → 0%), opens 4-switch (Output 3 → 40%). Two concurrent control loops run every 30 seconds for the rest of the run:
 
-**Phase 4 — Cycle ³He:** Turns off 3-pump (Output 2 → 0%), opens 3-switch (Output 4 → 40%). Passive monitoring only. Exits when 3-head sustains below 350mK for 5 minutes.
+- **4-switch regulation** (phases 3–5): keeps `Switch_Temp_K` (4-switch temperature) in **20–22K** by adjusting Output 3 in the range 20–45% (−2% if above 22K, +2% if below 20K). If the switch has not reached 20K after 15 minutes a warning is logged; the feedback will keep increasing Output 3 toward 45% until it opens.
+- **3-pump management**: Output 2 is boosted without a rate-limit if the 3-pump cools — the switch opening creates a large thermal disturbance that can rapidly cool the 3-pump. Includes **predictive lookahead**: if the rolling-average temperature extrapolated forward would drop below 45K within 1 minute (+8% boost) or 2 minutes (+5% boost), Output 2 is increased pre-emptively while the pump is still in range. Once the pump has already dropped below 45K the response is +8% (falling fast, < −0.3 K/min) or +3% (falling, < −0.1 K/min); below 40K the response is +10% (emergency). Output 2 can reach 100% during this phase.
 
-**Phase 5 — Running:** Holds all outputs at entry values. Monitors every 5 minutes. Exits and alerts when ⁴He is exhausted (4-head > 3K and rising at > 0.01 K/min). Typical hold time: ~36 hours.
+Exits when both heads fall below 2.0K.
+
+**Phase 4 — Cycle ³He:** Turns off 3-pump (Output 2 → 0%), opens 3-switch (Output 4 → 40%). Output 3 (4-switch) continues to be regulated in the 20–22K range as in Phase 3. No other adjustments are made. Exits when 3-head sustains below 350mK for 5 minutes.
+
+**Phase 5 — Running:** Output 3 (4-switch) continues to be regulated in the 20–22K range. All other outputs are held at their Phase 4 exit values. Monitors every 5 minutes. Exits and alerts when ⁴He is exhausted (4-head > 3K and rising at > 0.01 K/min). Typical hold time: ~36 hours.
 
 ### Safety limits
 
@@ -452,6 +457,8 @@ temps/YYYY-MM-DD_temperature_log_2.csv
 
 Columns (19 total, fixed-width space-padded):
 `Timestamp, Date, Time, 4K_Stage_Temp, ADR_Res, ADR_Temp, Switch_Volt, Switch_Temp, 3Head_Res, 3Head_Temp, 4Head_Res_Raw, 4Head_Res_Adj, 4Head_Temp, 3Pump_Volt, 3Pump_Temp, 4Pump_Volt, 4Pump_Temp, LS370_In1_Res, LS370_In1_Temp`
+
+`Switch_Temp` (`Switch_Temp_K`) is the **4-switch temperature** (LS350 D2). It is the primary feedback signal for Output 3 regulation in phases 3–5 of the GL7 cooldown.
 
 Interval: 30 seconds (default), configurable with `--interval`
 

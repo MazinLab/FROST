@@ -22,10 +22,13 @@ use crate::lakeshore350::LakeShore350Controller;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 // Phase 1: Ramp-up
-const RAMP_STEP_INTERVAL_SECS: u64 = 30;    // seconds between fixed-schedule steps
-const RAMP_POLL_SECS: u64         = 30;     // seconds between CSV reads during hold
+const RAMP_STEP_INTERVAL_SECS: u64       = 30;   // seconds between fixed-schedule steps
+const RAMP_POLL_SECS: u64               = 30;   // seconds between CSV reads during hold
+const RAMP_STEPDOWN_THRESHOLD_4PUMP: f64 = 45.0; // K — begin stepping Output 1 down
+const RAMP_STEPDOWN_THRESHOLD_3PUMP: f64 = 42.0; // K — begin stepping Output 2 down
+const RAMP_STEP_DOWN: f64               = 8.0;  // % reduction per step
 
-// Phase 2 initial targets (applied at end of Phase 1)
+// Phase 2 initial targets (floor values Phase 1 steps down to)
 const OUTPUT1_INITIAL_STABILIZE: f64 = 25.0; // %
 const OUTPUT2_INITIAL_STABILIZE: f64 = 18.0; // %
 
@@ -48,12 +51,17 @@ const OUTPUT1_CEILING_STABILIZE: f64     = 50.0;  // % — ramp-up already compl
 const OUTPUT2_CEILING_STABILIZE: f64     = 40.0;  // %
 
 // Phase 3: Cycle ⁴He module
-const SWITCH_ON_OUTPUT: f64             = 40.0;   // % — Output 3 on entry
-const SWITCH_OPEN_TEMP: f64             = 20.0;   // K — switch considered fully open
-const SWITCH_OPEN_TIMEOUT_SECS: u64     = 900;    // 15 min — boost if switch hasn't opened
-const SWITCH_BOOST_OUTPUT: f64          = 45.0;   // % — boost value if timeout fires
+const SWITCH_ON_OUTPUT: f64             = 40.0;   // % — Output 3 initial value on entry
+const SWITCH_OPEN_TEMP: f64             = 20.0;   // K — 4-switch lower temp limit (also signals open)
+const SWITCH4_TEMP_HIGH: f64            = 22.0;   // K — 4-switch upper temp limit (phases 3–5)
+const OUTPUT3_FLOOR: f64                = 20.0;   // % — Output 3 minimum during active regulation
+const OUTPUT3_CEILING: f64              = 45.0;   // % — Output 3 maximum during active regulation
+const SWITCH4_ADJUST_STEP: f64          = 2.0;    // % — Output 3 adjustment per control iteration
+const SWITCH_OPEN_TIMEOUT_SECS: u64     = 900;    // 15 min — warn if switch hasn't reached 20 K
 const HEAD_CYCLE_THRESHOLD: f64         = 2.0;    // K — both heads below this → Phase 4
 const PUMP3_EMERGENCY_LOW: f64          = 40.0;   // K — aggressive recovery threshold
+const PUMP3_LOOKAHEAD_FAST_MINS: f64    = 1.0;    // min — boost +8% if predicted to leave range within this
+const PUMP3_LOOKAHEAD_SLOW_MINS: f64    = 2.0;    // min — boost +5% if predicted to leave range within this
 const SWITCH3_DANGER_TEMP: f64          = 14.0;   // K — 3-switch opening risk
 
 // Phase 4: Cycle ³He module
@@ -82,14 +90,14 @@ const BUSY_RETRY_SECS: u64              = 15;     // s — sleep between retries
 ///
 /// Column mapping (0-based indices into the whitespace-split row):
 ///   3  → 4K_Stage_Temp_K   (LS350 D3)
-///   7  → Switch_Temp_K     (LS350 D2 — whichever switch is currently wired)
+///   7  → Switch_Temp_K     (LS350 D2 — 4-switch temperature)
 ///   9  → 3_Head_Temp_K     (LS350 A)
 ///  12  → 4_Head_Temp_K     (LS350 C)
 ///  14  → 3_Pump_Temp_K     (LS350 D4)
 ///  16  → 4_Pump_Temp_K     (LS350 D5)
 pub struct TempSnapshot {
     pub stage_4k_k: f64,
-    pub switch_k:   f64,  // whichever switch is currently wired to D2
+    pub switch_k:   f64,  // 4-switch temperature (LS350 D2, Switch_Temp_K column)
     pub head3_k:    f64,
     pub head4_k:    f64,
     pub pump3_k:    f64,
@@ -304,6 +312,102 @@ pub fn pump_control_step(
     Some((new_out, reason))
 }
 
+// ── 4-switch regulation helper (phases 3–5) ──────────────────────────────────
+
+/// Compute an Output 3 adjustment to keep the 4-switch temperature in
+/// [`SWITCH_OPEN_TEMP`, `SWITCH4_TEMP_HIGH`] = [20 K, 22 K].
+///
+/// Returns `Some((new_output, reason))` if an adjustment is warranted, clamped
+/// to [`OUTPUT3_FLOOR`, `OUTPUT3_CEILING`] = [20%, 45%]. Returns `None` if the
+/// temperature is already in range or the output is already at its limit.
+pub fn switch_control_step(switch_k: f64, current_out: f64) -> Option<(f64, &'static str)> {
+    let (delta, reason): (f64, &'static str) = if switch_k > SWITCH4_TEMP_HIGH {
+        (-SWITCH4_ADJUST_STEP, "4-switch above 22 K")
+    } else if switch_k < SWITCH_OPEN_TEMP {
+        (SWITCH4_ADJUST_STEP, "4-switch below 20 K")
+    } else {
+        return None;
+    };
+    let new_out = (current_out + delta).clamp(OUTPUT3_FLOOR, OUTPUT3_CEILING);
+    if (new_out - current_out).abs() < 0.001 {
+        return None;
+    }
+    Some((new_out, reason))
+}
+
+// ── Phase 3 pump control helper ───────────────────────────────────────────────
+
+/// Compute an Output 2 adjustment for the 3-pump during Phase 3.
+///
+/// Applies four tiers of response (highest priority first):
+///
+/// 1. **Emergency** (`p3_avg < 40 K`): +10% — gas re-adsorption imminent.
+/// 2. **Below lower limit** (`p3_avg < 45 K`): +8% if falling fast (< −0.3 K/min),
+///    +3% if falling (< −0.1 K/min).
+/// 3. **In range but predicted to leave** (`45–55 K`): +8% if predicted to exit in
+///    < 1 min at current rate; +5% if predicted to exit in 1–2 min.
+/// 4. **Above upper limit** (`p3_avg > 55 K`): −5%.
+///
+/// Returns `Some((new_output, reason))` clamped to `[0%, 100%]`, or `None` if
+/// no adjustment is warranted or the output is already at its limit.
+pub fn pump3_phase3_step(
+    p3_avg: f64,
+    p3_dt: f64,
+    current_out: f64,
+) -> Option<(f64, &'static str)> {
+    let (delta, reason): (f64, &'static str) = if p3_avg < PUMP3_EMERGENCY_LOW {
+        (10.0, "3-pump emergency (< 40 K)")
+    } else if p3_avg < PUMP3_TARGET_LOW {
+        // Below lower limit — react immediately based on rate of change.
+        if p3_dt < -0.3 {
+            (8.0, "3-pump below lower limit, falling fast")
+        } else if p3_dt < -0.1 {
+            (3.0, "3-pump below lower limit, falling")
+        } else {
+            return None;
+        }
+    } else if p3_avg > PUMP3_TARGET_HIGH {
+        (-5.0, "3-pump above upper limit")
+    } else {
+        // In range [45 K, 55 K] — predictive lookahead.
+        // If current rate of change will carry the pump below 45 K within the
+        // next 1–2 minutes, pre-emptively increase output now.
+        let predicted_1min = p3_avg + p3_dt * PUMP3_LOOKAHEAD_FAST_MINS;
+        let predicted_2min = p3_avg + p3_dt * PUMP3_LOOKAHEAD_SLOW_MINS;
+        if predicted_1min < PUMP3_TARGET_LOW {
+            (8.0, "3-pump in range but predicted out in < 1 min")
+        } else if predicted_2min < PUMP3_TARGET_LOW {
+            (5.0, "3-pump in range but predicted out in 1-2 min")
+        } else {
+            return None;
+        }
+    };
+
+    let new_out = (current_out + delta).clamp(0.0, 100.0);
+    if (new_out - current_out).abs() < 0.001 {
+        return None;
+    }
+    Some((new_out, reason))
+}
+
+// ── Phase 1 step-down helper ──────────────────────────────────────────────────
+
+/// Compute a Phase 1 step-down for one pump output.
+///
+/// Once the pump crosses `threshold`, the output is reduced by `RAMP_STEP_DOWN`
+/// (8%) per poll iteration until it reaches `floor`.
+///
+/// Returns `Some(new_output)` (clamped to `floor`) if a step is warranted.
+/// Returns `None` if the pump has not yet crossed the threshold or the output
+/// is already at the floor.
+pub fn phase1_stepdown_step(pump_k: f64, threshold: f64, current_out: f64, floor: f64) -> Option<f64> {
+    if pump_k >= threshold && current_out > floor + 0.001 {
+        Some((current_out - RAMP_STEP_DOWN).max(floor))
+    } else {
+        None
+    }
+}
+
 // ── Phase 0: Precondition check ───────────────────────────────────────────────
 //
 // Verify the system is in the expected cold state before starting the cooldown.
@@ -410,25 +514,24 @@ pub fn phase0_check(csv_path: &str) -> Result<(), String> {
 //   t = 0:00  →  Output1 = 30%,  Output2 = 30%
 //   t = 0:30  →  Output1 = 50%,  Output2 = 50%
 //   t = 1:00  →  Output1 = 80%,  Output2 = 60%
-//   t = 1:30  →  hold at 80% / 60% until a pump crosses 40 K
+//   t = 1:30  →  hold at 80% / 60% and begin polling
 //
-// Step-down (once a pump crosses 40 K):
-//   Every 60 s, reduce that pump's output by 8% to prevent overshoot.
-//   Floor: Output1 ≥ 25%,  Output2 ≥ 18%  (approximate steady-state values).
+// Step-down (once a pump crosses its threshold):
+//   4-pump ≥ 45 K → reduce Output 1 by 8% per poll until it reaches 25%.
+//   3-pump ≥ 42 K → reduce Output 2 by 8% per poll until it reaches 18%.
+//   Each pump steps down independently; the other pump continues at its
+//   current output until its own threshold is crossed.
 //
 // Exit condition:
-//   Both pumps > 40 K → set Output1 = 25%, Output2 = 18%, transition to Phase 2.
+//   Both Output 1 = 25% AND Output 2 = 18% → transition to Phase 2.
 
-/// Run Phase 1: ramp both pumps to their Phase 2 target minimums.
+/// Run Phase 1: ramp both pumps and step outputs down as they approach target.
 ///
 /// Executes the fixed three-step ramp schedule, then holds at 80%/60% and polls
-/// the CSV. Exits as soon as *either* pump reaches its minimum target temperature
-/// (4-pump ≥ 50 K, 3-pump ≥ 45 K). Safety hard limits are checked every poll.
-///
-/// Returns the output levels in effect at handoff. For each pump that crossed
-/// its minimum, the output is set to `OUTPUT1/2_INITIAL_STABILIZE` before
-/// returning. Pumps that have not yet crossed their minimum are left at their
-/// current output so Phase 2 can take over once they arrive.
+/// the CSV every 30 s. Once a pump crosses its step-down threshold (4-pump ≥ 45 K,
+/// 3-pump ≥ 42 K), its output is reduced by 8% per poll until it reaches its
+/// floor (Output 1 → 25%, Output 2 → 18%). Safety hard limits are checked every
+/// poll. Returns when both outputs have reached their floors.
 pub fn phase1_ramp_pumps(csv_path: &str) -> Result<(f64, f64), String> {
     println!(
         "[GL7] Phase 1 — ramping both pumps to target range ({:.0}K / {:.0}K)...",
@@ -474,50 +577,70 @@ pub fn phase1_ramp_pumps(csv_path: &str) -> Result<(f64, f64), String> {
         // ── Safety hard limits ────────────────────────────────────────────────
         if t.pump4_k > PUMP_HARD_LIMIT {
             let new_val = (out1 - 20.0).max(0.0);
-            set_output_pct(&mut ls350, 1, new_val)?; out1 = new_val;
-            println!(
-                "[GL7] SAFETY: 4-pump at {:.3} K > {:.0} K — Output 1 cut by 20%",
-                t.pump4_k, PUMP_HARD_LIMIT
-            );
+            if (new_val - out1).abs() > 0.001 {
+                println!(
+                    "[GL7] SAFETY: 4-pump at {:.3} K > {:.0} K — Output 1 cut by 20%",
+                    t.pump4_k, PUMP_HARD_LIMIT
+                );
+                set_output_pct(&mut ls350, 1, new_val)?; out1 = new_val;
+            }
         }
         if t.pump3_k > PUMP_HARD_LIMIT {
             let new_val = (out2 - 20.0).max(0.0);
-            set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
-            println!(
-                "[GL7] SAFETY: 3-pump at {:.3} K > {:.0} K — Output 2 cut by 20%",
-                t.pump3_k, PUMP_HARD_LIMIT
-            );
+            if (new_val - out2).abs() > 0.001 {
+                println!(
+                    "[GL7] SAFETY: 3-pump at {:.3} K > {:.0} K — Output 2 cut by 20%",
+                    t.pump3_k, PUMP_HARD_LIMIT
+                );
+                set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
+            }
         }
         if t.stage_4k_k > STAGE_4K_HARD_LIMIT {
             let new_1 = (out1 - 10.0).max(0.0);
             let new_2 = (out2 - 10.0).max(0.0);
-            set_output_pct(&mut ls350, 1, new_1)?; out1 = new_1;
-            set_output_pct(&mut ls350, 2, new_2)?; out2 = new_2;
+            let ch1 = (new_1 - out1).abs() > 0.001;
+            let ch2 = (new_2 - out2).abs() > 0.001;
+            if ch1 || ch2 {
+                println!(
+                    "[GL7] SAFETY: 4K stage at {:.3} K > {:.0} K — Outputs 1 & 2 cut by 10%",
+                    t.stage_4k_k, STAGE_4K_HARD_LIMIT
+                );
+                if ch1 { set_output_pct(&mut ls350, 1, new_1)?; out1 = new_1; }
+                if ch2 { set_output_pct(&mut ls350, 2, new_2)?; out2 = new_2; }
+            }
+        }
+
+        // ── Step-down: reduce outputs as each pump approaches target ─────────
+        if let Some(new_val) = phase1_stepdown_step(
+            t.pump4_k, RAMP_STEPDOWN_THRESHOLD_4PUMP, out1, OUTPUT1_INITIAL_STABILIZE,
+        ) {
             println!(
-                "[GL7] SAFETY: 4K stage at {:.3} K > {:.0} K — Outputs 1 & 2 cut by 10%",
-                t.stage_4k_k, STAGE_4K_HARD_LIMIT
+                "[GL7]   4-pump {:.3} K ≥ {:.0} K — stepping Output 1: {:.1}% → {:.1}%",
+                t.pump4_k, RAMP_STEPDOWN_THRESHOLD_4PUMP, out1, new_val
             );
+            set_output_pct(&mut ls350, 1, new_val)?;
+            out1 = new_val;
+        }
+        if let Some(new_val) = phase1_stepdown_step(
+            t.pump3_k, RAMP_STEPDOWN_THRESHOLD_3PUMP, out2, OUTPUT2_INITIAL_STABILIZE,
+        ) {
+            println!(
+                "[GL7]   3-pump {:.3} K ≥ {:.0} K — stepping Output 2: {:.1}% → {:.1}%",
+                t.pump3_k, RAMP_STEPDOWN_THRESHOLD_3PUMP, out2, new_val
+            );
+            set_output_pct(&mut ls350, 2, new_val)?;
+            out2 = new_val;
         }
 
         // ── Exit condition ────────────────────────────────────────────────────
-        if t.pump4_k >= PUMP4_TARGET_LOW || t.pump3_k >= PUMP3_TARGET_LOW {
+        if (out1 - OUTPUT1_INITIAL_STABILIZE).abs() < 0.001
+            && (out2 - OUTPUT2_INITIAL_STABILIZE).abs() < 0.001
+        {
             println!(
-                "[GL7]   At least one pump reached its target minimum \
-                 (4-pump {:.3} K, 3-pump {:.3} K) — handing off to Phase 2.",
-                t.pump4_k, t.pump3_k
+                "[GL7] Phase 1 complete — both outputs at floor \
+                 ({:.0}% / {:.0}%), transitioning to Phase 2.",
+                out1, out2
             );
-            // Only drop outputs for pumps that have crossed their minimum.
-            // Pumps still ramping stay at their current output so Phase 2
-            // can take control once they arrive.
-            if t.pump4_k >= PUMP4_TARGET_LOW {
-                set_output_pct(&mut ls350, 1, OUTPUT1_INITIAL_STABILIZE)?;
-                out1 = OUTPUT1_INITIAL_STABILIZE;
-            }
-            if t.pump3_k >= PUMP3_TARGET_LOW {
-                set_output_pct(&mut ls350, 2, OUTPUT2_INITIAL_STABILIZE)?;
-                out2 = OUTPUT2_INITIAL_STABILIZE;
-            }
-            println!("[GL7] Phase 1 complete — transitioning to Phase 2.");
             return Ok((out1, out2));
         }
     }
@@ -658,33 +781,39 @@ pub fn phase2_stabilize(csv_path: &str, out1_init: f64, out2_init: f64) -> Resul
         // ── Safety hard limits (override phase logic) ─────────────────────────
         if t.pump4_k > PUMP_HARD_LIMIT {
             let new_val = (out1 - 20.0).max(0.0);
-            println!(
-                "[GL7] SAFETY: 4-pump {:.3} K > {:.0} K — Output 1 cut by 20%",
-                t.pump4_k, PUMP_HARD_LIMIT
-            );
-            set_output_pct(&mut ls350, 1, new_val)?; out1 = new_val;
-            last_adj_1 = Instant::now();
+            if (new_val - out1).abs() > 0.001 {
+                println!(
+                    "[GL7] SAFETY: 4-pump {:.3} K > {:.0} K — Output 1 cut by 20%",
+                    t.pump4_k, PUMP_HARD_LIMIT
+                );
+                set_output_pct(&mut ls350, 1, new_val)?; out1 = new_val;
+                last_adj_1 = Instant::now();
+            }
         }
         if t.pump3_k > PUMP_HARD_LIMIT {
             let new_val = (out2 - 20.0).max(0.0);
-            println!(
-                "[GL7] SAFETY: 3-pump {:.3} K > {:.0} K — Output 2 cut by 20%",
-                t.pump3_k, PUMP_HARD_LIMIT
-            );
-            set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
-            last_adj_2 = Instant::now();
+            if (new_val - out2).abs() > 0.001 {
+                println!(
+                    "[GL7] SAFETY: 3-pump {:.3} K > {:.0} K — Output 2 cut by 20%",
+                    t.pump3_k, PUMP_HARD_LIMIT
+                );
+                set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
+                last_adj_2 = Instant::now();
+            }
         }
         if t.stage_4k_k > STAGE_4K_HARD_LIMIT {
             let new_1 = (out1 - 10.0).max(OUTPUT1_FLOOR_STABILIZE);
             let new_2 = (out2 - 10.0).max(OUTPUT2_FLOOR_STABILIZE);
-            println!(
-                "[GL7] SAFETY: 4K stage {:.3} K > {:.0} K — Outputs 1 & 2 cut by 10%",
-                t.stage_4k_k, STAGE_4K_HARD_LIMIT
-            );
-            set_output_pct(&mut ls350, 1, new_1)?; out1 = new_1;
-            set_output_pct(&mut ls350, 2, new_2)?; out2 = new_2;
-            last_adj_1 = Instant::now();
-            last_adj_2 = Instant::now();
+            let ch1 = (new_1 - out1).abs() > 0.001;
+            let ch2 = (new_2 - out2).abs() > 0.001;
+            if ch1 || ch2 {
+                println!(
+                    "[GL7] SAFETY: 4K stage {:.3} K > {:.0} K — Outputs 1 & 2 cut by 10%",
+                    t.stage_4k_k, STAGE_4K_HARD_LIMIT
+                );
+                if ch1 { set_output_pct(&mut ls350, 1, new_1)?; out1 = new_1; last_adj_1 = Instant::now(); }
+                if ch2 { set_output_pct(&mut ls350, 2, new_2)?; out2 = new_2; last_adj_2 = Instant::now(); }
+            }
         }
 
         // ── Absolute hard timeout ─────────────────────────────────────────────
@@ -975,19 +1104,23 @@ pub fn phase3_cycle_4he(csv_path: &str, out2_entry: f64) -> Result<f64, String> 
         // ── Safety hard limits ────────────────────────────────────────────────
         if t.pump3_k > PUMP_HARD_LIMIT {
             let new_val = (out2 - 20.0).max(0.0);
-            println!(
-                "[GL7] SAFETY: 3-pump {:.3} K > {:.0} K — Output 2 cut by 20%",
-                t.pump3_k, PUMP_HARD_LIMIT
-            );
-            set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
+            if (new_val - out2).abs() > 0.001 {
+                println!(
+                    "[GL7] SAFETY: 3-pump {:.3} K > {:.0} K — Output 2 cut by 20%",
+                    t.pump3_k, PUMP_HARD_LIMIT
+                );
+                set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
+            }
         }
         if t.stage_4k_k > STAGE_4K_HARD_LIMIT {
             let new_val = (out2 - 10.0).max(0.0);
-            println!(
-                "[GL7] SAFETY: 4K stage {:.3} K > {:.0} K — Output 2 cut by 10%",
-                t.stage_4k_k, STAGE_4K_HARD_LIMIT
-            );
-            set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
+            if (new_val - out2).abs() > 0.001 {
+                println!(
+                    "[GL7] SAFETY: 4K stage {:.3} K > {:.0} K — Output 2 cut by 10%",
+                    t.stage_4k_k, STAGE_4K_HARD_LIMIT
+                );
+                set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
+            }
         }
 
         // ── 3-switch protection ───────────────────────────────────────────────
@@ -995,14 +1128,18 @@ pub fn phase3_cycle_4he(csv_path: &str, out2_entry: f64) -> Result<f64, String> 
         if t.stage_4k_k > SWITCH3_DANGER_TEMP {
             let new_out3 = (out3 - 5.0).max(0.0);
             let new_out2 = (out2 + 5.0).min(100.0);
-            println!(
-                "[GL7] WARNING: 3-switch proxy (4K stage) {:.3} K > {:.0} K — \
-                 reducing Output 3: {:.1}% → {:.1}%, boosting Output 2: {:.1}% → {:.1}%",
-                t.stage_4k_k, SWITCH3_DANGER_TEMP,
-                out3, new_out3, out2, new_out2,
-            );
-            set_output_pct(&mut ls350, 3, new_out3)?; out3 = new_out3;
-            set_output_pct(&mut ls350, 2, new_out2)?; out2 = new_out2;
+            let ch3 = (new_out3 - out3).abs() > 0.001;
+            let ch2 = (new_out2 - out2).abs() > 0.001;
+            if ch3 || ch2 {
+                println!(
+                    "[GL7] WARNING: 3-switch proxy (4K stage) {:.3} K > {:.0} K — \
+                     reducing Output 3: {:.1}% → {:.1}%, boosting Output 2: {:.1}% → {:.1}%",
+                    t.stage_4k_k, SWITCH3_DANGER_TEMP,
+                    out3, new_out3, out2, new_out2,
+                );
+                if ch3 { set_output_pct(&mut ls350, 3, new_out3)?; out3 = new_out3; }
+                if ch2 { set_output_pct(&mut ls350, 2, new_out2)?; out2 = new_out2; }
+            }
         }
 
         // ── 4-switch monitoring ───────────────────────────────────────────────
@@ -1018,52 +1155,32 @@ pub fn phase3_cycle_4he(csv_path: &str, out2_entry: f64) -> Result<f64, String> 
             && t.switch_k < SWITCH_OPEN_TEMP
         {
             println!(
-                "[GL7]   4-switch not open after {} min ({:.3} K < {:.0} K) — \
-                 boosting Output 3: {:.1}% → {:.1}%",
-                SWITCH_OPEN_TIMEOUT_SECS / 60, t.switch_k, SWITCH_OPEN_TEMP,
-                out3, SWITCH_BOOST_OUTPUT,
+                "[GL7] WARNING: 4-switch not at {:.0} K after {} min ({:.3} K) — \
+                 continuous feedback will keep increasing Output 3 toward {:.0}%.",
+                SWITCH_OPEN_TEMP, SWITCH_OPEN_TIMEOUT_SECS / 60,
+                t.switch_k, OUTPUT3_CEILING,
             );
-            set_output_pct(&mut ls350, 3, SWITCH_BOOST_OUTPUT)?; out3 = SWITCH_BOOST_OUTPUT;
             switch_boost_applied = true;
+        }
+
+        // ── 4-switch temperature regulation ──────────────────────────────────
+        // Keep switch_k in [20 K, 22 K] by adjusting Output 3 ∈ [20%, 45%].
+        if let Some((new_out3, reason)) = switch_control_step(t.switch_k, out3) {
+            println!(
+                "[GL7]   Output 3: {:.1}% → {:.1}%  (4-switch {:.3} K, {})",
+                out3, new_out3, t.switch_k, reason,
+            );
+            set_output_pct(&mut ls350, 3, new_out3)?; out3 = new_out3;
         }
 
         // ── 3-pump management ─────────────────────────────────────────────────
         // No minimum interval between adjustments — the 3-pump can cool rapidly
         // when the 4-switch opens and needs aggressive, immediate response.
-        if p3_avg < PUMP3_EMERGENCY_LOW {
-            let new_val = (out2 + 10.0).min(100.0);
+        // Predictive lookahead triggers pre-emptive boosts while still in range.
+        if let Some((new_val, reason)) = pump3_phase3_step(p3_avg, p3_dt, out2) {
             println!(
-                "[GL7]   3-pump avg {:.2} K < {:.0} K (emergency) — \
-                 Output 2: {:.1}% → {:.1}%",
-                p3_avg, PUMP3_EMERGENCY_LOW, out2, new_val,
-            );
-            set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
-        } else if p3_avg < PUMP3_TARGET_LOW {
-            // 40 K ≤ p3_avg < 45 K — moderate intervention based on dT/dt
-            if p3_dt < -0.3 {
-                let new_val = (out2 + 8.0).min(100.0);
-                println!(
-                    "[GL7]   3-pump avg {:.2} K, falling fast ({:+.3} K/min) — \
-                     Output 2: {:.1}% → {:.1}%",
-                    p3_avg, p3_dt, out2, new_val,
-                );
-                set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
-            } else if p3_dt < -0.1 {
-                let new_val = (out2 + 3.0).min(100.0);
-                println!(
-                    "[GL7]   3-pump avg {:.2} K, falling ({:+.3} K/min) — \
-                     Output 2: {:.1}% → {:.1}%",
-                    p3_avg, p3_dt, out2, new_val,
-                );
-                set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
-            }
-        } else if p3_avg > PUMP3_TARGET_HIGH {
-            // > 55 K — bleed off excess heat
-            let new_val = (out2 - 5.0).max(0.0);
-            println!(
-                "[GL7]   3-pump avg {:.2} K > {:.0} K (too warm) — \
-                 Output 2: {:.1}% → {:.1}%",
-                p3_avg, PUMP3_TARGET_HIGH, out2, new_val,
+                "[GL7]   3-pump avg {:.2} K ({:+.3} K/min) — Output 2: {:.1}% → {:.1}%  ({})",
+                p3_avg, p3_dt, out2, new_val, reason,
             );
             set_output_pct(&mut ls350, 2, new_val)?; out2 = new_val;
         }
@@ -1142,21 +1259,35 @@ pub fn phase4_cycle_3he(csv_path: &str, out3_entry: f64) -> Result<(f64, f64), S
         if t.stage_4k_k > STAGE_4K_HARD_LIMIT {
             let new_out3 = (out3 - 10.0).max(0.0);
             let new_out4 = (out4 - 10.0).max(0.0);
+            let ch3 = (new_out3 - out3).abs() > 0.001;
+            let ch4 = (new_out4 - out4).abs() > 0.001;
+            if ch3 || ch4 {
+                println!(
+                    "[GL7] SAFETY: 4K stage {:.3} K > {:.0} K — Outputs 3 & 4 cut by 10%",
+                    t.stage_4k_k, STAGE_4K_HARD_LIMIT
+                );
+                if ch3 { set_output_pct(&mut ls350, 3, new_out3)?; out3 = new_out3; }
+                if ch4 { set_output_pct(&mut ls350, 4, new_out4)?; out4 = new_out4; }
+            }
+        }
+
+        // ── 4-switch temperature regulation ──────────────────────────────────
+        // Keep switch_k in [20 K, 22 K] by adjusting Output 3 ∈ [20%, 45%].
+        if let Some((new_out3, reason)) = switch_control_step(t.switch_k, out3) {
             println!(
-                "[GL7] SAFETY: 4K stage {:.3} K > {:.0} K — Outputs 3 & 4 cut by 10%",
-                t.stage_4k_k, STAGE_4K_HARD_LIMIT
+                "[GL7]   Output 3: {:.1}% → {:.1}%  (4-switch {:.3} K, {})",
+                out3, new_out3, t.switch_k, reason,
             );
             set_output_pct(&mut ls350, 3, new_out3)?; out3 = new_out3;
-            set_output_pct(&mut ls350, 4, new_out4)?; out4 = new_out4;
         }
 
         // ── State log ─────────────────────────────────────────────────────────
         println!(
             "[GL7] t={:.1}m | 3-head {:.4} K | 4-head {:.3} K | \
-             out3={:.1}%  out4={:.1}% | 4K stage {:.3} K",
+             4-switch {:.3} K out3={:.1}%  out4={:.1}% | 4K stage {:.3} K",
             elapsed.as_secs_f64() / 60.0,
             t.head3_k, t.head4_k,
-            out3, out4,
+            t.switch_k, out3, out4,
             t.stage_4k_k,
         );
 
@@ -1238,11 +1369,13 @@ pub fn phase4_cycle_3he(csv_path: &str, out3_entry: f64) -> Result<(f64, f64), S
 pub fn phase5_running(csv_path: &str, out3_entry: f64, out4_entry: f64) -> Result<(), String> {
     println!("[GL7] Phase 5 — running at base temperature.");
     println!(
-        "[GL7]   Outputs held: out1=0.0%  out2=0.0%  out3={:.1}%  out4={:.1}%",
+        "[GL7]   Initial outputs: out1=0.0%  out2=0.0%  out3={:.1}%  out4={:.1}%",
         out3_entry, out4_entry,
     );
     println!("[GL7]   Monitoring every {} min. Typical hold time ~36 hours.", PHASE5_POLL_SECS / 60);
 
+    let mut ls350 = LakeShore350Controller::default();
+    let mut out3 = out3_entry;
     let phase_start = Instant::now();
     let mut head4_avg = RollingAverage::new(4);
     let mut head3_avg = RollingAverage::new(4);
@@ -1258,12 +1391,24 @@ pub fn phase5_running(csv_path: &str, out3_entry: f64, out4_entry: f64) -> Resul
 
         let h4_dt = head4_avg.rate_of_change();
 
+        // ── 4-switch temperature regulation ──────────────────────────────────
+        // Keep switch_k in [20 K, 22 K] by adjusting Output 3 ∈ [20%, 45%].
+        if let Some((new_out3, reason)) = switch_control_step(t.switch_k, out3) {
+            println!(
+                "[GL7]   Output 3: {:.1}% → {:.1}%  (4-switch {:.3} K, {})",
+                out3, new_out3, t.switch_k, reason,
+            );
+            set_output_pct(&mut ls350, 3, new_out3)?; out3 = new_out3;
+        }
+
         println!(
             "[GL7] t={:.1}h | 3-head {:.4} K | 4-head {:.3} K ({:+.4} K/min) | \
+             4-switch {:.3} K out3={:.1}% | \
              3-pump {:.3} K | 4-pump {:.3} K | 4K stage {:.3} K",
             elapsed.as_secs_f64() / 3600.0,
             t.head3_k,
             t.head4_k, h4_dt,
+            t.switch_k, out3,
             t.pump3_k, t.pump4_k,
             t.stage_4k_k,
         );
