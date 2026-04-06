@@ -13,6 +13,7 @@
 use clap::{Parser, Subcommand};
 
 use crate::compressor::CryomechController;
+use crate::gl7_automation;
 use crate::heatswitch::{HeatswitchController, HEATSWITCH_TRAVEL_STEPS};
 use crate::lakeshore625::LakeShore625Controller;
 use crate::lakeshore370::LakeShore370Controller;
@@ -96,6 +97,104 @@ pub enum Device {
     RecordTemps {
         #[command(subcommand)]
         command: RecordTempsCmd,
+    },
+
+    /// GL7 sorption cooler automated cooldown
+    Gl7 {
+        #[command(subcommand)]
+        command: Gl7Cmd,
+    },
+}
+
+// ── GL7 subcommands ───────────────────────────────────────────
+#[derive(Subcommand)]
+pub enum Gl7Cmd {
+    /// Check preconditions before starting a cooldown (Phase 0).
+    ///
+    /// Reads the most recent row of the temperature CSV and queries the LS350
+    /// to verify the system is in the expected cold state. Aborts with an
+    /// error message if any condition fails.
+    Check {
+        #[arg(long, help = "Temperature CSV written by 'frost record-temps loop'")]
+        csv: String,
+    },
+    /// Ramp both pumps to 40 K (Phase 1).
+    ///
+    /// Executes the fixed three-step ramp schedule, then monitors the CSV until
+    /// both pumps exceed 40 K, stepping outputs down to prevent overshoot.
+    /// Dry-run mode: prints what each output change would be; no hardware writes.
+    RampPumps {
+        #[arg(long, help = "Temperature CSV written by 'frost record-temps loop'")]
+        csv: String,
+    },
+    /// Stabilize pumps and wait for heads to cool (Phase 2).
+    ///
+    /// Holds 4-pump at 50–60 K and 3-pump at 45–55 K using a rate-limited
+    /// feedback loop. Exits when both heads plateau below 5.7 K and all four
+    /// exit conditions are met.
+    /// Dry-run mode: prints what each output change would be; no hardware writes.
+    Stabilize {
+        #[arg(long, help = "Temperature CSV written by 'frost record-temps loop'")]
+        csv: String,
+        #[arg(long, default_value_t = 25.0,
+              help = "Output 1 (4-pump %) handed off from Phase 1")]
+        out1: f64,
+        #[arg(long, default_value_t = 18.0,
+              help = "Output 2 (3-pump %) handed off from Phase 1")]
+        out2: f64,
+    },
+    /// Cycle the ⁴He module (Phase 3).
+    ///
+    /// Turns off the 4-pump heater, opens the 4-switch, and keeps the 3-pump
+    /// warm while waiting for both heads to cool below 2 K. --out2 is the
+    /// Output 2 percentage active at the end of Phase 2.
+    /// Dry-run mode: prints what each output change would be; no hardware writes.
+    #[command(name = "cycle-4he")]
+    Cycle4he {
+        #[arg(long, help = "Temperature CSV written by 'frost record-temps loop'")]
+        csv: String,
+        #[arg(long, default_value_t = 18.0,
+              help = "Output 2 (3-pump %) handed off from Phase 2")]
+        out2: f64,
+    },
+    /// Cycle the ³He module (Phase 4).
+    ///
+    /// Turns off the 3-pump heater and opens the 3-switch. Monitors passively
+    /// until the 3-head sustains below 350 mK for 5 minutes. --out3 is the
+    /// Output 3 percentage active at the end of Phase 3.
+    /// Dry-run mode: prints what each output change would be; no hardware writes.
+    #[command(name = "cycle-3he")]
+    Cycle3he {
+        #[arg(long, help = "Temperature CSV written by 'frost record-temps loop'")]
+        csv: String,
+        #[arg(long, default_value_t = 40.0,
+              help = "Output 3 (4-switch %) handed off from Phase 3")]
+        out3: f64,
+    },
+    /// Monitor at base temperature (Phase 5).
+    ///
+    /// Holds all outputs at entry values and monitors every 5 minutes. Exits
+    /// when ⁴He is exhausted (4-head > 3 K and rising at > 0.01 K/min).
+    /// --out3/--out4 are the switch heater percentages handed off from Phase 4.
+    Running {
+        #[arg(long, help = "Temperature CSV written by 'frost record-temps loop'")]
+        csv: String,
+        #[arg(long, default_value_t = 40.0,
+              help = "Output 3 (4-switch %) handed off from Phase 4")]
+        out3: f64,
+        #[arg(long, default_value_t = 40.0,
+              help = "Output 4 (3-switch %) handed off from Phase 4")]
+        out4: f64,
+    },
+    /// Run the full cooldown sequence: Phase 0 → Phase 5.
+    ///
+    /// Checks preconditions, ramps both pumps, stabilizes, cycles ⁴He and ³He,
+    /// then monitors at base temperature until ⁴He is exhausted. Halts on any
+    /// phase failure.
+    /// Dry-run mode: prints what each output change would be; no hardware writes.
+    Cooldown {
+        #[arg(long, help = "Temperature CSV written by 'frost record-temps loop'")]
+        csv: String,
     },
 }
 
@@ -421,6 +520,15 @@ pub fn run() -> Result<(), String> {
         Device::RecordTemps { command } => {
             run_record_temps(command)
         }
+        Device::Gl7 { command } => match command {
+            Gl7Cmd::Check { csv } => gl7_automation::phase0_check(&csv),
+            Gl7Cmd::RampPumps { csv } => gl7_automation::phase1_ramp_pumps(&csv).map(|_| ()),
+            Gl7Cmd::Stabilize { csv, out1, out2 } => gl7_automation::phase2_stabilize(&csv, out1, out2).map(|_| ()),
+            Gl7Cmd::Cycle4he { csv, out2 } => gl7_automation::phase3_cycle_4he(&csv, out2).map(|_| ()),
+            Gl7Cmd::Cycle3he { csv, out3 } => gl7_automation::phase4_cycle_3he(&csv, out3).map(|_| ()),
+            Gl7Cmd::Running { csv, out3, out4 } => gl7_automation::phase5_running(&csv, out3, out4),
+            Gl7Cmd::Cooldown { csv } => gl7_automation::run_cooldown(&csv),
+        },
         Device::Adr { command } => match command {
             AdrCmd::Ramp { rate, current, soak_mins } => {
                 crate::adr_ramping::run_adr_ramp(rate, current, soak_mins, None)
