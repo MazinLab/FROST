@@ -7,7 +7,7 @@
 
 use clap::Parser;
 use frost::cli::{
-    AdrCmd, Cli, CompressorCmd, Device, HeatswitchCmd, Lakeshore350Cmd, Lakeshore370Cmd,
+    AdrCmd, Cli, CompressorCmd, Device, Gl7Cmd, HeatswitchCmd, Lakeshore350Cmd, Lakeshore370Cmd,
     Lakeshore625Cmd, RecordTempsCmd,
 };
 
@@ -616,4 +616,134 @@ fn unknown_device_fails() {
 #[test]
 fn unknown_subcommand_fails() {
     parse_fails(&["frost", "lakeshore625", "teleport"]);
+}
+
+// ── gl7 subcommands ────────────────────────────────────────────────────────────
+
+#[test]
+fn gl7_check_parses_csv() {
+    let cli = parse(&["frost", "gl7", "check", "--csv", "/tmp/temps.csv"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Check { csv } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+}
+
+#[test]
+fn gl7_ramp_pumps_parses_csv() {
+    let cli = parse(&["frost", "gl7", "ramp-pumps", "--csv", "/tmp/temps.csv"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::RampPumps { csv } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+}
+
+#[test]
+fn gl7_stabilize_parses_csv() {
+    let cli = parse(&["frost", "gl7", "stabilize", "--csv", "/tmp/temps.csv"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Stabilize { csv } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+}
+
+#[test]
+fn gl7_check_missing_csv_fails() {
+    parse_fails(&["frost", "gl7", "check"]);
+}
+
+#[test]
+fn gl7_stabilize_missing_csv_fails() {
+    parse_fails(&["frost", "gl7", "stabilize"]);
+}
+
+#[test]
+fn gl7_unknown_subcommand_fails() {
+    parse_fails(&["frost", "gl7", "cycle"]);
+}
+
+#[test]
+fn gl7_cooldown_parses_csv() {
+    let cli = parse(&["frost", "gl7", "cooldown", "--csv", "/tmp/temps.csv"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Cooldown { csv } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+}
+
+#[test]
+fn gl7_cooldown_missing_csv_fails() {
+    parse_fails(&["frost", "gl7", "cooldown"]);
+}
+
+#[test]
+fn gl7_cycle_4he_parses_csv_with_default_out2() {
+    let cli = parse(&["frost", "gl7", "cycle-4he", "--csv", "/tmp/temps.csv"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Cycle4he { csv, out2 } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+    assert!((out2 - 18.0).abs() < 1e-9, "default out2 must be 18.0, got {out2}");
+}
+
+#[test]
+fn gl7_cycle_4he_parses_out2_override() {
+    let cli = parse(&["frost", "gl7", "cycle-4he", "--csv", "/tmp/temps.csv", "--out2", "22.5"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Cycle4he { csv, out2 } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+    assert!((out2 - 22.5).abs() < 1e-9, "out2 must be 22.5, got {out2}");
+}
+
+#[test]
+fn gl7_cycle_4he_missing_csv_fails() {
+    parse_fails(&["frost", "gl7", "cycle-4he"]);
+}
+
+#[test]
+fn gl7_cycle_3he_parses_csv_with_default_out3() {
+    let cli = parse(&["frost", "gl7", "cycle-3he", "--csv", "/tmp/temps.csv"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Cycle3he { csv, out3 } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+    assert!((out3 - 40.0).abs() < 1e-9, "default out3 must be 40.0, got {out3}");
+}
+
+#[test]
+fn gl7_cycle_3he_parses_out3_override() {
+    let cli = parse(&["frost", "gl7", "cycle-3he", "--csv", "/tmp/temps.csv", "--out3", "45.0"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Cycle3he { csv, out3 } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+    assert!((out3 - 45.0).abs() < 1e-9, "out3 must be 45.0, got {out3}");
+}
+
+#[test]
+fn gl7_cycle_3he_missing_csv_fails() {
+    parse_fails(&["frost", "gl7", "cycle-3he"]);
+}
+
+#[test]
+fn gl7_running_parses_csv_with_defaults() {
+    let cli = parse(&["frost", "gl7", "running", "--csv", "/tmp/temps.csv"]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Running { csv, out3, out4 } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+    assert!((out3 - 40.0).abs() < 1e-9, "default out3 must be 40.0, got {out3}");
+    assert!((out4 - 40.0).abs() < 1e-9, "default out4 must be 40.0, got {out4}");
+}
+
+#[test]
+fn gl7_running_parses_out3_and_out4_overrides() {
+    let cli = parse(&[
+        "frost", "gl7", "running",
+        "--csv", "/tmp/temps.csv",
+        "--out3", "38.0",
+        "--out4", "42.5",
+    ]);
+    let Device::Gl7 { command } = cli.device else { panic!() };
+    let Gl7Cmd::Running { csv, out3, out4 } = command else { panic!() };
+    assert_eq!(csv, "/tmp/temps.csv");
+    assert!((out3 - 38.0).abs() < 1e-9, "out3 must be 38.0, got {out3}");
+    assert!((out4 - 42.5).abs() < 1e-9, "out4 must be 42.5, got {out4}");
+}
+
+#[test]
+fn gl7_running_missing_csv_fails() {
+    parse_fails(&["frost", "gl7", "running"]);
 }
