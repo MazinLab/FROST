@@ -12,6 +12,11 @@ Cargo.lock
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
 
+# Runtime state and data directories
+state/
+temps/
+ramps/
+
 # IDE files
 .vscode/
 .idea/

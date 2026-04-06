@@ -1,4 +1,5 @@
 mod adr_ramping;
+mod gl7_automation;
 mod compressor;
 mod heatswitch;
 mod lakeshore625;
