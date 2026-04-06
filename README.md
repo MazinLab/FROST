@@ -312,6 +312,121 @@ Logs are written to `temps/YYYY-MM-DD_temperature_log.csv`. If a file already ex
 
 ---
 
+## GL7 Sorption Cooler Cooldown
+
+The `frost gl7` commands automate the cooldown of a Chase Research Cryogenics GL7 two-stage ³He sorption cooler from ~3.8K to ~320mK base temperature. The controller reads temperature data from the CSV written by `frost record-temps loop` and writes output percentages to the Lakeshore 350. **Temperature recording must be running before and during the cooldown.**
+
+### Output map
+
+| Output | Connection | Type | Role |
+|--------|-----------|------|------|
+| Output 1 | 4-pump heater | Heater range 5 | Heats the ⁴He pump |
+| Output 2 | 3-pump heater | Heater range 5 | Heats the ³He pump |
+| Analog Output 3 | 4-switch heater | Analog | Opens the ⁴He heat switch |
+| Analog Output 4 | 3-switch heater | Analog | Opens the ³He heat switch |
+
+### CLI commands
+
+```bash
+frost gl7 <subcommand> --csv <path>
+```
+
+All subcommands require `--csv` pointing to the temperature log written by `frost record-temps loop`.
+
+```bash
+# Check preconditions before starting a cooldown (Phase 0)
+frost gl7 check --csv temps/YYYY-MM-DD_temperature_log.csv
+
+# Ramp both pumps up (Phase 1)
+frost gl7 ramp-pumps --csv temps/YYYY-MM-DD_temperature_log.csv
+
+# Stabilize pumps, wait for heads to cool (Phase 2)
+# --out1 and --out2 are the output percentages handed off from Phase 1
+# (defaults: 25.0% and 18.0% if running Phase 2 standalone)
+frost gl7 stabilize --csv temps/YYYY-MM-DD_temperature_log.csv
+frost gl7 stabilize --csv temps/... --out1 25.0 --out2 18.0
+
+# Cycle ⁴He module (Phase 3)
+# --out2 is the 3-pump output % handed off from Phase 2 (default 18.0%)
+frost gl7 cycle-4he --csv temps/YYYY-MM-DD_temperature_log.csv
+frost gl7 cycle-4he --csv temps/... --out2 18.0
+
+# Cycle ³He module (Phase 4)
+# --out3 is the 4-switch output % handed off from Phase 3 (default 40.0%)
+frost gl7 cycle-3he --csv temps/YYYY-MM-DD_temperature_log.csv
+frost gl7 cycle-3he --csv temps/... --out3 40.0
+
+# Monitor at base temperature (Phase 5)
+# --out3/--out4 are switch heater percentages handed off from Phase 4 (default 40.0% each)
+frost gl7 running --csv temps/YYYY-MM-DD_temperature_log.csv
+frost gl7 running --csv temps/... --out3 40.0 --out4 40.0
+
+# Run the full automated sequence: Phase 0 → Phase 5
+frost gl7 cooldown --csv temps/YYYY-MM-DD_temperature_log.csv
+```
+
+### Phase sequence
+
+```
+Phase 0: Precondition check  (~instant)
+Phase 1: Ramp up both pumps  (~25 min)
+Phase 2: Stabilize pumps, heads cool  (~60–90 min)
+Phase 3: Cycle ⁴He module  (~60–75 min)
+Phase 4: Cycle ³He module  (~25–35 min)
+Phase 5: Running at base temperature  (~36 hours)
+```
+
+**Total time to base temperature: ~3 hours.** The full sequence can be run unattended with `frost gl7 cooldown`, or each phase can be run individually if manual intervention is needed between steps.
+
+### Phase details
+
+**Phase 0 — Precondition check:** Verifies the system is in the expected cold state before starting. Checks 4K stage < 4.5K, both heat switches OFF (< 10K), both heads < 5K, both pumps < 10K.
+
+**Phase 1 — Ramp up:** Executes a fixed time-based ramp schedule (30%→50%→80% for Output 1, 30%→50%→60% for Output 2 over 90 seconds), then holds at 80%/60% until at least one pump reaches its Phase 2 minimum temperature. Exits to Phase 2 when either pump exceeds its minimum (4-pump: 50K, 3-pump: 45K), dropping that pump's output to its initial stabilization value. A pump that has not yet reached its minimum keeps its Phase 1 output level until it arrives.
+
+**Phase 2 — Stabilize:** Holds 4-pump at 50–60K and 3-pump at 45–55K using a rate-limited feedback loop (adjustments at most once every 3 minutes per output). Uses rolling averages and dT/dt to avoid reacting to noise. Exits when the **4-head** plateaus below 5.45K, both pumps have been in range for 10+ continuous minutes, and the system has been settled for 5+ minutes. These exit conditions may be changed over time. Timeout exit available after 120 minutes if both heads are below 6.0K. 
+
+**Phase 3 — Cycle ⁴He:** Turns off 4-pump (Output 1 → 0%), opens 4-switch (Output 3 → 40%). Monitors 3-pump and increases Output 2 aggressively if it drops below 45K (up to 100% if needed — the switch opening creates a large thermal disturbance). Exits when both heads fall below 2.0K.
+
+**Phase 4 — Cycle ³He:** Turns off 3-pump (Output 2 → 0%), opens 3-switch (Output 4 → 40%). Passive monitoring only. Exits when 3-head sustains below 350mK for 5 minutes.
+
+**Phase 5 — Running:** Holds all outputs at entry values. Monitors every 5 minutes. Exits and alerts when ⁴He is exhausted (4-head > 3K and rising at > 0.01 K/min). Typical hold time: ~36 hours.
+
+### Safety limits
+
+These override all phase logic at every iteration:
+
+| Condition | Action |
+|-----------|--------|
+| Any pump > 65K | Reduce that pump's output by 20% immediately |
+| 4K stage > 12K | Reduce all heater outputs by 10% |
+| Phase 2 running > 180 minutes | Log error, halt |
+| Any output > 100% | Clamp to 100% |
+| Any output < 0% | Clamp to 0% |
+
+### Typical workflow
+
+```bash
+# 1. Start temperature recording (run in a tmux pane — must stay running)
+frost record-temps loop --interval 30
+
+# 2. In another pane, run the full cooldown
+frost gl7 cooldown --csv temps/YYYY-MM-DD_temperature_log.csv
+```
+
+Or, to run phases individually with the ability to intervene between steps:
+
+```bash
+frost gl7 check      --csv temps/...
+frost gl7 ramp-pumps --csv temps/...
+frost gl7 stabilize  --csv temps/...
+frost gl7 cycle-4he  --csv temps/...
+frost gl7 cycle-3he  --csv temps/...
+frost gl7 running    --csv temps/...
+```
+
+---
+
 ## Data Logging
 
 ### Ramp Logs
