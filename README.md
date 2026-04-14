@@ -93,42 +93,38 @@ cargo run --release -- gui
 
 The GUI runs a background worker thread that polls all devices every 30 seconds (staggered to avoid serial bus contention) while keeping the interface responsive. All serial I/O happens off the render thread.
 
-### GUI Sections
+### Layout
 
-**Compressor**
-- Start/Stop buttons with live status display
-- Shows running state and last update time
-- Compressor intent is persisted to disk (`state/.compressor_intent`) — if FROST CLI or GUI is restarted, the GUI restores the last known compressor state
+The GUI is divided into five sections displayed top-to-bottom. A fixed status bar sits above the scrollable content and is always visible.
 
-**Magnet (Lakeshore 625)**
-- Live readouts: current (A), voltage (V), field
-- Editable fields: current setpoint, current/voltage/rate limits, ramp rate, compliance voltage
-- "Set" buttons apply each parameter to the instrument
-- Values are auto-populated from hardware polls when new data arrives
-
-**GL7 Outputs (Lakeshore 350)**
-- Displays output percentage for each of the 4 GL7 heater/switch outputs
-- Editable percentage fields with "Set" buttons to apply
+**Status Bar**
+- Always-visible strip at the very top showing a one-line system summary
+- Four indicator chips: **Compressor**, **ADR Ramp**, **GL7**, **Recording**
+- Chip is green (active) or dark/muted (inactive)
+- GL7 is considered active if any heater/switch output is non-zero or the 3-Head temperature is below 400 mK
 
 **Thermometry**
-- Live temperature readings from all LS350 inputs (A, B, C, D2, D3, D4, D5) and LS370 input 1
+- Live temperature readings from all LS350 inputs (4K Stage, ADR, 4-Switch, 3-Head, 4-Head, 3-Pump, 4-Pump) and LS370 input 1 (Device Stage)
 - Inputs using custom calibration (3-head, 4-head, pump diodes) show calibrated temperatures in Kelvin
-- Direct Lakeshore-calibrated inputs (B, D3) show kelvin directly
+- **Record Temperatures** button starts continuous CSV logging to `temps/YYYY-MM-DD_temperature_log.csv` at 30-second intervals; button turns red and reads "Stop Recording Temperatures" while active
+- Recording state persists across restarts (`temps/.recording_active` lock file) — the GUI detects an interrupted recording on startup and resumes it automatically
 
-**Temperature Recording**
-- Start/Stop buttons for continuous CSV logging
-- Logs all thermometry inputs at 30-second intervals to `temps/YYYY-MM-DD_temperature_log.csv`
-- Recording state persists across restarts (`temps/.recording_active` lock file) — the GUI detects an interrupted recording on startup and resumes it
+**Compressor**
+- Start/Stop buttons with live status display (running state, error flags)
+- Compressor intent is persisted to disk (`state/.compressor_intent`) — if FROST is restarted, the GUI restores the last known compressor state
 
-**ADR Ramp**
+**ADR Cooldown**
+- Live readouts: output current (A), voltage (V), magnetic field (T)
 - Input fields for ramp rate (A/s), target current (A), and soak time (minutes)
-- Start button executes the full automated ramp sequence
-- Live log output displayed in the GUI during ramp
+- **Start ADR Cooldown** launches the full automated ramp sequence; button turns red and shows elapsed time while the ramp is running
+- Live log output displayed in the GUI during the ramp
 - Ramp state persisted to `state/.adr_ramp_running` — detects interrupted ramps on restart
 
-### Theme
-
-17 color themes selectable from the top of the GUI window (Default, Dark, Light Blue, Purple, and more).
+**GL7 Sorption Cooler**
+- **Start GL7 Cooldown** launches the full automated GL7 cooldown sequence (`frost gl7 cooldown`) as a subprocess; button turns red and reads "GL7 Cooldown In-Progress" until the process exits
+- CSV path field: paste the path to the active temperature recording, or click **Current Temperature Recording** to auto-fill from the running recording
+- Live output percentage display for all four outputs (4-Pump Heater, 3-Pump Heater, 4-Switch Heater, 3-Switch Heater)
+- DragValue + **Set** buttons to manually override any output percentage
 
 ---
 
@@ -384,11 +380,13 @@ Phase 5: Running at base temperature  (~36 hours)
 
 **Phase 1 — Ramp up:** Executes a fixed time-based ramp schedule (30%→50%→80% for Output 1, 30%→50%→60% for Output 2 over 90 seconds), then holds at 80%/60% and polls every 30 s. Once the 4-pump reaches 45K, Output 1 is stepped down by 8% per poll until it reaches 25%. Once the 3-pump reaches 42K, Output 2 is stepped down by 8% per poll until it reaches 18%. The two pumps step down independently. Phase 1 exits when both outputs have reached their floors (25% / 18%).
 
+The 3-pump step-down starts at **42K**, which is 3K below the target band of 45–55K. This is intentional overshoot prevention: at 60% output the pump is rising at several K/min, so waiting until 45K to begin stepping down would result in the pump coasting well past 55K before the reduced output takes effect. Starting at 42K gives the step-down ~3K of runway to arrest the rise before the pump enters the target range. The same principle applies to the 4-pump, whose step-down begins at 45K — 15K below its 60K upper limit.
+
 **Phase 2 — Stabilize:** Holds 4-pump at 50–60K and 3-pump at 45–55K using a rate-limited feedback loop (adjustments at most once every 3 minutes per output). Uses rolling averages and dT/dt to avoid reacting to noise. Exits when the **4-head** plateaus below 5.45K, both pumps have been in range for 10+ continuous minutes, and the system has been settled for 5+ minutes. These exit conditions may be changed over time. Timeout exit available after 120 minutes if both heads are below 6.0K. 
 
 **Phase 3 — Cycle ⁴He:** Turns off 4-pump (Output 1 → 0%), opens 4-switch (Output 3 → 40%). Two concurrent control loops run every 30 seconds for the rest of the run:
 
-- **4-switch regulation** (phases 3–5): keeps `Switch_Temp_K` (4-switch temperature) in **20–22K** by adjusting Output 3 in the range 20–45% (−2% if above 22K, +2% if below 20K). If the switch has not reached 20K after 15 minutes a warning is logged; the feedback will keep increasing Output 3 toward 45% until it opens.
+- **4-switch regulation** (phases 3–5): keeps `Switch_Temp_K` (4-switch temperature) in **20–22K** by adjusting Output 3 in the range 20–45% (−5% if above 22K, +5% if below 20K). If the switch has not reached 20K after 15 minutes a warning is logged; the feedback will keep increasing Output 3 toward 45% until it opens.
 - **3-pump management**: Output 2 is boosted without a rate-limit if the 3-pump cools — the switch opening creates a large thermal disturbance that can rapidly cool the 3-pump. Includes **predictive lookahead**: if the rolling-average temperature extrapolated forward would drop below 45K within 1 minute (+8% boost) or 2 minutes (+5% boost), Output 2 is increased pre-emptively while the pump is still in range. Once the pump has already dropped below 45K the response is +8% (falling fast, < −0.3 K/min) or +3% (falling, < −0.1 K/min); below 40K the response is +10% (emergency). Output 2 can reach 100% during this phase.
 
 Exits when both heads fall below 2.0K.
@@ -411,6 +409,11 @@ These override all phase logic at every iteration:
 
 ### Typical workflow
 
+**Via GUI (recommended):**
+1. In the Thermometry section, click **Record Temperatures** to start logging
+2. In the GL7 Sorption Cooler section, click **Current Temperature Recording** to auto-fill the CSV path, then click **Start GL7 Cooldown**
+
+**Via CLI:**
 ```bash
 # 1. Start temperature recording (run in a tmux pane — must stay running)
 frost record-temps loop --interval 30

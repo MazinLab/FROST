@@ -640,7 +640,7 @@ fn gl7_ramp_pumps_parses_csv() {
 fn gl7_stabilize_parses_csv() {
     let cli = parse(&["frost", "gl7", "stabilize", "--csv", "/tmp/temps.csv"]);
     let Device::Gl7 { command } = cli.device else { panic!() };
-    let Gl7Cmd::Stabilize { csv } = command else { panic!() };
+    let Gl7Cmd::Stabilize { csv, .. } = command else { panic!() };
     assert_eq!(csv, "/tmp/temps.csv");
 }
 

@@ -521,12 +521,30 @@ pub fn run() -> Result<(), String> {
             run_record_temps(command)
         }
         Device::Gl7 { command } => match command {
-            Gl7Cmd::Check { csv } => gl7_automation::phase0_check(&csv),
-            Gl7Cmd::RampPumps { csv } => gl7_automation::phase1_ramp_pumps(&csv).map(|_| ()),
-            Gl7Cmd::Stabilize { csv, out1, out2 } => gl7_automation::phase2_stabilize(&csv, out1, out2).map(|_| ()),
-            Gl7Cmd::Cycle4he { csv, out2 } => gl7_automation::phase3_cycle_4he(&csv, out2).map(|_| ()),
-            Gl7Cmd::Cycle3he { csv, out3 } => gl7_automation::phase4_cycle_3he(&csv, out3).map(|_| ()),
-            Gl7Cmd::Running { csv, out3, out4 } => gl7_automation::phase5_running(&csv, out3, out4),
+            Gl7Cmd::Check { csv } => {
+                let mut log = gl7_automation::Gl7Logger::new(&csv)?;
+                gl7_automation::phase0_check(&csv, &mut log)
+            }
+            Gl7Cmd::RampPumps { csv } => {
+                let mut log = gl7_automation::Gl7Logger::new(&csv)?;
+                gl7_automation::phase1_ramp_pumps(&csv, &mut log).map(|_| ())
+            }
+            Gl7Cmd::Stabilize { csv, out1, out2 } => {
+                let mut log = gl7_automation::Gl7Logger::new(&csv)?;
+                gl7_automation::phase2_stabilize(&csv, out1, out2, &mut log).map(|_| ())
+            }
+            Gl7Cmd::Cycle4he { csv, out2 } => {
+                let mut log = gl7_automation::Gl7Logger::new(&csv)?;
+                gl7_automation::phase3_cycle_4he(&csv, out2, &mut log).map(|_| ())
+            }
+            Gl7Cmd::Cycle3he { csv, out3 } => {
+                let mut log = gl7_automation::Gl7Logger::new(&csv)?;
+                gl7_automation::phase4_cycle_3he(&csv, out3, &mut log).map(|_| ())
+            }
+            Gl7Cmd::Running { csv, out3, out4 } => {
+                let mut log = gl7_automation::Gl7Logger::new(&csv)?;
+                gl7_automation::phase5_running(&csv, out3, out4, &mut log)
+            }
             Gl7Cmd::Cooldown { csv } => gl7_automation::run_cooldown(&csv),
         },
         Device::Adr { command } => match command {

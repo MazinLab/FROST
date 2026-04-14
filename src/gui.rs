@@ -29,30 +29,7 @@ fn apply_fonts(ctx: &egui::Context) {
     ctx.set_fonts(egui::FontDefinitions::default());
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Theme {
-    Default,
-    LightBlue,
-    Purple,
-    Dark,
-    White,
-    Black,
-    Red,
-    Green,
-    Blue,
-    Yellow,
-    Cyan,
-    Magenta,
-    Gray,
-    LightGray,
-    DarkGray,
-    EguiLightBlue,
-    EguiLightGreen,
-    EguiLightRed,
-}
-
 struct FrostApp {
-    selected_theme: Theme,
     worker: SerialWorker,
 
     // ── User-editable fields (live on the GUI side) ───────────
@@ -75,6 +52,11 @@ struct FrostApp {
     magnet_rate_set_msg:      Option<Result<(), String>>,
     magnet_compliance_set_msg: Option<Result<(), String>>,
     gl7_set_msg: Vec<Option<Result<(), String>>>,
+
+    // ── GL7 cooldown ─────────────────────────────────────────
+    gl7_cooldown_csv_path: String,
+    gl7_cooldown_result:   Option<Result<String, String>>,
+    gl7_cooldown_child:    Option<std::process::Child>,
 
     // ── Temperature recording ─────────────────────────────────
     record_result:        Option<Result<String, String>>,
@@ -105,7 +87,6 @@ impl FrostApp {
             };
 
         Self {
-            selected_theme: Theme::EguiLightBlue,
             worker,
             magnet_target_current:          9.44,
             magnet_edit_current_limit:      10.0,
@@ -122,6 +103,9 @@ impl FrostApp {
             magnet_rate_set_msg:       None,
             magnet_compliance_set_msg: None,
             gl7_set_msg: vec![None, None, None, None],
+            gl7_cooldown_csv_path: recording_csv_path.as_deref().unwrap_or("").to_string(),
+            gl7_cooldown_result:   None,
+            gl7_cooldown_child:    None,
             record_result,
             recording_stop_flag,
             recording_csv_path,
@@ -187,6 +171,17 @@ impl eframe::App for FrostApp {
         self.sync_edit_fields(&snap);
 
         // ── 3. Render ─────────────────────────────────────────────────────
+
+        // Status bar — always visible at the top, does not scroll
+        let status_frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(38, 55, 95))
+            .inner_margin(egui::Margin::symmetric(14.0, 7.0));
+        egui::TopBottomPanel::top("status_bar")
+            .frame(status_frame)
+            .show(ctx, |ui| {
+                self.show_status_bar(ui, &snap);
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(8.0);
@@ -206,41 +201,18 @@ impl eframe::App for FrostApp {
                 ui.separator();
                 ui.add_space(10.0);
 
-                ui.strong("Theme / Color");
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Thermometry")
+                            .size(32.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(40, 40, 140)),
+                    )
+                    .selectable(false),
+                );
+                ui.add_space(10.0);
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Theme:");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Default, "Default");
-                    ui.selectable_value(&mut self.selected_theme, Theme::LightBlue, "Light Blue");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Purple, "Purple");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Dark, "Dark");
-                });
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Colors:");
-                    ui.selectable_value(&mut self.selected_theme, Theme::White, "White");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Black, "Black");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Red, "Red");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Green, "Green");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Blue, "Blue");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Yellow, "Yellow");
-                });
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("More:");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Cyan, "Cyan");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Magenta, "Magenta");
-                    ui.selectable_value(&mut self.selected_theme, Theme::Gray, "Gray");
-                    ui.selectable_value(&mut self.selected_theme, Theme::LightGray, "Light Gray");
-                    ui.selectable_value(&mut self.selected_theme, Theme::DarkGray, "Dark Gray");
-                });
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Egui:");
-                    ui.selectable_value(&mut self.selected_theme, Theme::EguiLightBlue, "Egui Light Blue");
-                    ui.selectable_value(&mut self.selected_theme, Theme::EguiLightGreen, "Egui Light Green");
-                    ui.selectable_value(&mut self.selected_theme, Theme::EguiLightRed, "Egui Light Red");
-                });
+                self.show_temperature_display(ui, &snap);
 
                 ui.add_space(20.0);
                 ui.separator();
@@ -259,23 +231,6 @@ impl eframe::App for FrostApp {
                 ui.add_space(10.0);
 
                 self.show_gl7_section(ui, &snap);
-
-                ui.add_space(20.0);
-                ui.separator();
-                ui.add_space(10.0);
-
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Thermometry")
-                            .size(32.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(40, 40, 140)),
-                    )
-                    .selectable(false),
-                );
-                ui.add_space(10.0);
-
-                self.show_temperature_display(ui, &snap);
             });
         });
 
@@ -285,114 +240,80 @@ impl eframe::App for FrostApp {
 }
 
 impl FrostApp {
+    fn show_status_bar(&self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
+        let is_recording = self.recording_stop_flag
+            .as_ref()
+            .map(|f| !f.load(Ordering::Relaxed))
+            .unwrap_or(false);
+
+        let outputs_on = snap.gl7_polled_pct.iter()
+            .any(|p| p.map(|v| v > 0.0).unwrap_or(false));
+        let head3_cold = snap.temperatures.ls350_a
+            .split_whitespace().next()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|k| k > 0.0 && k < 0.4)
+            .unwrap_or(false);
+        let gl7_active = outputs_on || head3_cold;
+
+        let chips: &[(&str, bool)] = &[
+            ("Compressor", snap.compressor_running),
+            ("ADR Ramp",   snap.adr_ramp_running),
+            ("GL7",        gl7_active),
+            ("Recording",  is_recording),
+        ];
+
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(
+                egui::RichText::new("STATUS")
+                    .strong()
+                    .size(11.0)
+                    .color(egui::Color32::from_rgb(170, 195, 255)),
+            ).selectable(false));
+
+            ui.add_space(10.0);
+
+            for &(label, active) in chips {
+                let (bg, fg, dot) = if active {
+                    (
+                        egui::Color32::from_rgb(28, 90, 48),
+                        egui::Color32::from_rgb(120, 230, 150),
+                        "●",
+                    )
+                } else {
+                    (
+                        egui::Color32::from_rgb(50, 60, 88),
+                        egui::Color32::from_rgb(170, 185, 220),
+                        "○",
+                    )
+                };
+                egui::Frame::none()
+                    .fill(bg)
+                    .rounding(egui::Rounding::same(5.0))
+                    .inner_margin(egui::Margin::symmetric(9.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(format!("{dot}  {label}"))
+                                .size(12.5)
+                                .color(fg)
+                                .strong(),
+                        ).selectable(false));
+                    });
+                ui.add_space(4.0);
+            }
+        });
+    }
+
     fn apply_theme(&self, ctx: &egui::Context) {
         let mut style = (*ctx.style()).clone();
-
-        match self.selected_theme {
-            Theme::Default => {
-                style = egui::Style::default();
-            }
-            Theme::LightBlue => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(230, 240, 255);
-                style.visuals.panel_fill = egui::Color32::from_rgb(240, 245, 255);
-            }
-            Theme::Purple => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(240, 230, 255);
-                style.visuals.panel_fill = egui::Color32::from_rgb(245, 240, 255);
-            }
-            Theme::Dark => {
-                style.visuals.dark_mode = true;
-                style.visuals.window_fill = egui::Color32::from_rgb(30, 30, 40);
-                style.visuals.panel_fill = egui::Color32::from_rgb(25, 25, 35);
-            }
-            Theme::White => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::WHITE;
-                style.visuals.panel_fill = egui::Color32::from_rgb(250, 250, 250);
-            }
-            Theme::Black => {
-                style.visuals.dark_mode = true;
-                style.visuals.window_fill = egui::Color32::BLACK;
-                style.visuals.panel_fill = egui::Color32::from_rgb(20, 20, 20);
-            }
-            Theme::Red => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(255, 230, 230);
-                style.visuals.panel_fill = egui::Color32::from_rgb(255, 240, 240);
-            }
-            Theme::Green => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(230, 255, 230);
-                style.visuals.panel_fill = egui::Color32::from_rgb(240, 255, 240);
-            }
-            Theme::Blue => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(230, 235, 255);
-                style.visuals.panel_fill = egui::Color32::from_rgb(240, 242, 255);
-            }
-            Theme::Yellow => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(255, 255, 225);
-                style.visuals.panel_fill = egui::Color32::from_rgb(255, 255, 240);
-            }
-            Theme::Cyan => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(225, 255, 255);
-                style.visuals.panel_fill = egui::Color32::from_rgb(240, 255, 255);
-            }
-            Theme::Magenta => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(255, 225, 255);
-                style.visuals.panel_fill = egui::Color32::from_rgb(255, 240, 255);
-            }
-            Theme::Gray => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(235, 235, 235);
-                style.visuals.panel_fill = egui::Color32::from_rgb(245, 245, 245);
-            }
-            Theme::LightGray => {
-                style.visuals.dark_mode = false;
-                style.visuals.window_fill = egui::Color32::from_rgb(245, 245, 245);
-                style.visuals.panel_fill = egui::Color32::from_rgb(250, 250, 250);
-            }
-            Theme::DarkGray => {
-                style.visuals.dark_mode = true;
-                style.visuals.window_fill = egui::Color32::from_rgb(45, 45, 45);
-                style.visuals.panel_fill = egui::Color32::from_rgb(35, 35, 35);
-            }
-            Theme::EguiLightBlue => {
-                style.visuals = egui::Visuals::light();
-                style.visuals.window_fill = egui::Color32::from_rgb(232, 240, 255);
-                style.visuals.panel_fill = egui::Color32::from_rgb(244, 248, 255);
-            }
-            Theme::EguiLightGreen => {
-                style.visuals = egui::Visuals::light();
-                style.visuals.window_fill = egui::Color32::from_rgb(235, 255, 235);
-                style.visuals.panel_fill = egui::Color32::from_rgb(245, 255, 245);
-            }
-            Theme::EguiLightRed => {
-                style.visuals = egui::Visuals::light();
-                style.visuals.window_fill = egui::Color32::from_rgb(255, 235, 235);
-                style.visuals.panel_fill = egui::Color32::from_rgb(255, 245, 245);
-            }
-        }
-
-        if style.visuals.dark_mode {
-            style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(45, 45, 55);
-            style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(55, 80, 130);
-            style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(45, 110, 220);
-        } else {
-            style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(255, 255, 255);
-            style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(210, 230, 255);
-            style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(120, 170, 255);
-        }
-
+        style.visuals = egui::Visuals::light();
+        style.visuals.window_fill = egui::Color32::from_rgb(232, 240, 255);
+        style.visuals.panel_fill = egui::Color32::from_rgb(244, 248, 255);
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(255, 255, 255);
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(210, 230, 255);
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(120, 170, 255);
         style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(120));
         style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
         style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(160));
-
         ctx.set_style(style);
     }
 
@@ -411,7 +332,7 @@ impl FrostApp {
         ui.horizontal(|ui| {
             if snap.compressor_running {
                 let btn = egui::Button::new(
-                    egui::RichText::new("⏹  Stop Compressor").strong()
+                    egui::RichText::new("⏹  Stop Compressor").strong().size(18.0)
                 )
                 .fill(egui::Color32::from_rgb(180, 40, 40));
                 if ui.add(btn).clicked() {
@@ -420,7 +341,7 @@ impl FrostApp {
                 }
             } else {
                 let btn = egui::Button::new(
-                    egui::RichText::new("▶  Start Pulse Tube Cooldown").strong()
+                    egui::RichText::new("▶  Start Pulse Tube Cooldown").strong().size(18.0)
                 )
                 .fill(egui::Color32::from_rgb(30, 120, 60));
                 if ui.add(btn).clicked() {
@@ -487,6 +408,64 @@ impl FrostApp {
         );
         ui.add_space(6.0);
 
+        // ── Start button / running indicator ─────────────────────
+        ui.horizontal(|ui| {
+            if snap.adr_ramp_running {
+                let elapsed = snap.adr_ramp_started
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                let mins = elapsed / 60;
+                let secs = elapsed % 60;
+                let btn = egui::Button::new(
+                    egui::RichText::new(
+                        format!("⏺  ADR Ramping  —  {mins}m {secs:02}s elapsed")
+                    )
+                    .strong()
+                    .size(18.0)
+                    .color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(185, 30, 30));
+                ui.add_enabled(false, btn);
+            } else {
+                let btn = egui::Button::new(
+                    egui::RichText::new("▶  Start ADR Cooldown")
+                        .strong()
+                        .size(18.0)
+                        .color(egui::Color32::from_rgb(15, 30, 80)),
+                )
+                .fill(egui::Color32::from_rgb(140, 185, 255));
+                if ui.add(btn).clicked() {
+                    self.adr_ramp_result = None;
+                    self.worker.send(GuiCommand::RunAdrRamp {
+                        rate:      self.adr_ramp_rate,
+                        current:   self.adr_ramp_current,
+                        soak_mins: self.adr_ramp_soak_mins,
+                    });
+                }
+            }
+        });
+
+        // ── Interrupted-ramp warning (set when lock file found on startup) ──
+        if snap.adr_ramp_interrupted {
+            ui.add_space(4.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "⚠  ADR ramp was running when the GUI was last closed — it did not complete.",
+            );
+            ui.add_space(4.0);
+        }
+
+        // ── Result feedback ───────────────────────────────────────
+        if let Some(ref res) = self.adr_ramp_result {
+            ui.add_space(4.0);
+            match res {
+                Ok(())  => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ ADR ramp sequence complete."); }
+                Err(e)  => { ui.colored_label(egui::Color32::RED, format!("ADR ramp error: {e}")); }
+            }
+        }
+
+        ui.add_space(8.0);
+
         // ── Live readback cards ──────────────────────────────────
         {
             let current_str = if snap.magnet_current.is_empty() {
@@ -505,15 +484,15 @@ impl FrostApp {
                 format!("{} T", snap.magnet_field)
             };
 
-            let cards: &[(&str, &str, &str)] = &[
-                ("Output Current", "LS625 · RDGI?", &current_str),
-                ("Output Voltage", "LS625 · RDGV?", &voltage_str),
-                ("Magnetic Field", "LS625 · RDGF?", &field_str),
+            let cards: &[(&str, &str)] = &[
+                ("Output Current", &current_str),
+                ("Output Voltage", &voltage_str),
+                ("Magnetic Field", &field_str),
             ];
 
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                for &(name, id, val) in cards {
+                for &(name, val) in cards {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(218, 235, 218))
                         .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(80, 140, 80)))
@@ -525,11 +504,6 @@ impl FrostApp {
                                 ui.add(egui::Label::new(
                                     egui::RichText::new(name).strong().size(14.0),
                                 ).selectable(false));
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(id)
-                                        .size(10.5)
-                                        .color(egui::Color32::from_gray(110)),
-                                ).selectable(false));
                                 ui.add_space(4.0);
                                 ui.add(egui::Label::new(
                                     egui::RichText::new(val).size(13.0).monospace(),
@@ -538,47 +512,6 @@ impl FrostApp {
                         });
                 }
             });
-        }
-
-        ui.add_space(8.0);
-
-        // ── Interrupted-ramp warning (set when lock file found on startup) ──
-        if snap.adr_ramp_interrupted {
-            ui.add_space(4.0);
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 120, 0),
-                "⚠  ADR ramp was running when the GUI was last closed — it did not complete.",
-            );
-            ui.add_space(4.0);
-        }
-
-        // ── Start button / running indicator ─────────────────────
-        if snap.adr_ramp_running {
-            let elapsed = snap.adr_ramp_started
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0);
-            let mins = elapsed / 60;
-            let secs = elapsed % 60;
-            let btn = egui::Button::new(
-                egui::RichText::new(
-                    format!("⏳  ADR Ramp Running…  {mins}m {secs:02}s elapsed")
-                ).strong(),
-            )
-            .fill(egui::Color32::from_rgb(140, 100, 20));
-            ui.add_enabled(false, btn);
-        } else {
-            let btn = egui::Button::new(
-                egui::RichText::new("▶  Start Automated ADR Ramp").strong(),
-            )
-            .fill(egui::Color32::from_rgb(40, 80, 170));
-            if ui.add(btn).clicked() {
-                self.adr_ramp_result = None;
-                self.worker.send(GuiCommand::RunAdrRamp {
-                    rate:      self.adr_ramp_rate,
-                    current:   self.adr_ramp_current,
-                    soak_mins: self.adr_ramp_soak_mins,
-                });
-            }
         }
 
         // ── Live ramp log ─────────────────────────────────────────
@@ -618,15 +551,6 @@ impl FrostApp {
         // Request repaint every second while running to keep the elapsed timer fresh.
         if snap.adr_ramp_running {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
-        }
-
-        // ── Result feedback ───────────────────────────────────────
-        if let Some(ref res) = self.adr_ramp_result {
-            ui.add_space(4.0);
-            match res {
-                Ok(())  => { ui.colored_label(egui::Color32::DARK_GREEN, "✔ ADR ramp sequence complete."); }
-                Err(e)  => { ui.colored_label(egui::Color32::RED, format!("ADR ramp error: {e}")); }
-            }
         }
 
         ui.add_space(8.0);
@@ -787,48 +711,104 @@ impl FrostApp {
         );
         ui.add_space(6.0);
 
-        let lines = snap.gl7_output_lines.clone();
+        // Check whether the GL7 subprocess has finished.
+        if let Some(ref mut child) = self.gl7_cooldown_child {
+            match child.try_wait() {
+                Ok(Some(_)) => { self.gl7_cooldown_child = None; }
+                Ok(None)    => {}  // still running
+                Err(_)      => { self.gl7_cooldown_child = None; }
+            }
+        }
+        let gl7_running = self.gl7_cooldown_child.is_some();
+
+        ui.horizontal(|ui| {
+            if gl7_running {
+                let btn = egui::Button::new(
+                    egui::RichText::new("⏺  GL7 Cooldown In-Progress")
+                        .strong()
+                        .size(18.0)
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(egui::Color32::from_rgb(185, 30, 30));
+                ui.add_enabled(false, btn);
+            } else {
+                let cooldown_btn = egui::Button::new(
+                    egui::RichText::new("Start GL7 Cooldown")
+                        .strong()
+                        .size(18.0)
+                        .color(egui::Color32::from_rgb(15, 30, 80)),
+                )
+                .fill(egui::Color32::from_rgb(140, 185, 255));
+                if ui.add(cooldown_btn).clicked() {
+                    let path = self.gl7_cooldown_csv_path.trim().to_string();
+                    if path.is_empty() {
+                        self.gl7_cooldown_result = Some(Err("No CSV path specified.".to_string()));
+                    } else {
+                        let exe = std::env::current_exe()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("frost"));
+                        match std::process::Command::new(&exe)
+                            .args(["gl7", "cooldown", "--csv", &path])
+                            .spawn()
+                        {
+                            Ok(child) => {
+                                self.gl7_cooldown_child = Some(child);
+                                self.gl7_cooldown_result =
+                                    Some(Ok(format!("GL7 cooldown started  (CSV: {path})")));
+                            }
+                            Err(e) => {
+                                self.gl7_cooldown_result =
+                                    Some(Err(format!("Failed to start cooldown: {e}")));
+                            }
+                        }
+                    }
+                }
+            }
+            ui.add_space(8.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.gl7_cooldown_csv_path)
+                    .desired_width(340.0)
+                    .hint_text("path to temperature CSV…"),
+            );
+            if ui.button("Current Temperature Recording").clicked() {
+                if let Some(ref p) = self.recording_csv_path {
+                    self.gl7_cooldown_csv_path = p.clone();
+                }
+            }
+        });
+        if let Some(ref res) = self.gl7_cooldown_result {
+            match res {
+                Ok(msg) => { ui.colored_label(egui::Color32::DARK_GREEN, msg); }
+                Err(e)  => { ui.colored_label(egui::Color32::RED, e.as_str()); }
+            }
+        }
+        ui.add_space(6.0);
+
         let output_names = ["4-Pump Heater", "3-Pump Heater", "4-Switch Heater", "3-Switch Heater"];
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            for (i, (l1, l2)) in lines.iter().enumerate() {
+            for i in 0..4 {
                 let output_num = i + 1;
                 let label = output_names[i];
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(255, 243, 220))
-                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(180, 130, 50)))
+                    .fill(egui::Color32::from_rgb(255, 230, 248))
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(195, 100, 165)))
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(egui::Margin::same(10.0))
                     .show(ui, |ui| {
-                        ui.set_min_width(220.0);
+                        ui.set_min_width(180.0);
                         ui.vertical(|ui| {
                             ui.add(egui::Label::new(
                                 egui::RichText::new(label).strong().size(14.0),
                             ).selectable(false));
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(format!("LS350 · Output {output_num}"))
-                                    .size(10.5)
-                                    .color(egui::Color32::from_gray(110)),
-                            ).selectable(false));
                             ui.add_space(4.0);
-                            if l1.is_empty() {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new("(pending…)")
-                                        .size(12.0)
-                                        .monospace()
-                                        .color(egui::Color32::from_gray(150)),
-                                ).selectable(false));
-                            } else {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(l1.as_str()).size(12.0).monospace(),
-                                ).selectable(false));
-                                if !l2.is_empty() {
-                                    ui.add(egui::Label::new(
-                                        egui::RichText::new(l2.as_str()).size(12.0).monospace(),
-                                    ).selectable(false));
-                                }
-                            }
+                            let pct_str = match snap.gl7_polled_pct.get(i).and_then(|v| *v) {
+                                Some(v) => format!("{v:.1} %"),
+                                None    => "(pending…)".to_string(),
+                            };
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(&pct_str).size(13.0).monospace(),
+                            ).selectable(false));
                             ui.add_space(6.0);
 
                             ui.horizontal(|ui| {
@@ -870,6 +850,7 @@ impl FrostApp {
         } else {
             ui.label("(pending first poll…)");
         }
+
     }
 
     fn show_temperature_display(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
@@ -879,14 +860,14 @@ impl FrostApp {
             .unwrap_or(false);
 
         ui.horizontal(|ui| {
-            ui.strong("Temperature Readings");
-            ui.add_space(12.0);
-
             if is_recording {
                 let btn = egui::Button::new(
-                    egui::RichText::new("⏹  Stop Recording Temperatures").strong()
+                    egui::RichText::new("⏹  Stop Recording Temperatures")
+                        .strong()
+                        .size(18.0)
+                        .color(egui::Color32::WHITE),
                 )
-                .fill(egui::Color32::from_rgb(180, 40, 40));
+                .fill(egui::Color32::from_rgb(185, 30, 30));
                 if ui.add(btn).clicked() {
                     if let Some(flag) = &self.recording_stop_flag {
                         flag.store(true, Ordering::Relaxed);
@@ -900,9 +881,12 @@ impl FrostApp {
                 }
             } else {
                 let btn = egui::Button::new(
-                    egui::RichText::new("⏺  Record Temperatures").strong()
+                    egui::RichText::new("⏺  Record Temperatures")
+                        .strong()
+                        .size(18.0)
+                        .color(egui::Color32::from_rgb(15, 30, 80)),
                 )
-                .fill(egui::Color32::from_rgb(30, 120, 60));
+                .fill(egui::Color32::from_rgb(140, 185, 255));
                 if ui.add(btn).clicked() {
                     match crate::record_temps::start_recording_loop(30, "temps") {
                         Ok((path, flag)) => {
@@ -933,20 +917,20 @@ impl FrostApp {
             .unwrap_or_else(|| t.ls350_b.clone());
         let elapsed = snap.last_temp_update.map(|t| t.elapsed().as_secs_f32());
 
-        let sensors: &[(&str, &str, &str)] = &[
-            ("4K Stage",     "LS350 · D3",  &t.ls350_d3),
-            ("ADR",          "LS350 · B",   &adr_temp),
-            ("Switch",       "LS350 · D2",  &t.ls350_d2),
-            ("3-Head",       "LS350 · A",   &t.ls350_a),
-            ("4-Head",       "LS350 · C",   &t.ls350_c),
-            ("3-Pump",       "LS350 · D4",  &t.ls350_d4),
-            ("4-Pump",       "LS350 · D5",  &t.ls350_d5),
-            ("Device Stage", "LS370 · In1", &t.ls370_1),
+        let sensors: &[(&str, &str)] = &[
+            ("4K Stage",     &t.ls350_d3),
+            ("ADR",          &adr_temp),
+            ("4-Switch",     &t.ls350_d2),
+            ("3-Head",       &t.ls350_a),
+            ("4-Head",       &t.ls350_c),
+            ("3-Pump",       &t.ls350_d4),
+            ("4-Pump",       &t.ls350_d5),
+            ("Device Stage", &t.ls370_1),
         ];
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-            for &(name, id, val) in sensors {
+            for &(name, val) in sensors {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(218, 230, 255))
                     .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(100, 130, 200)))
@@ -957,11 +941,6 @@ impl FrostApp {
                         ui.vertical(|ui| {
                             ui.add(egui::Label::new(
                                 egui::RichText::new(name).strong().size(14.0),
-                            ).selectable(false));
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(id)
-                                    .size(10.5)
-                                    .color(egui::Color32::from_gray(110)),
                             ).selectable(false));
                             ui.add_space(4.0);
                             ui.add(egui::Label::new(

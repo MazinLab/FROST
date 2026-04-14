@@ -12,7 +12,7 @@
 // No hardware is activated. No serial ports are opened.
 // Run with: cargo test --test gl7_automation_tests
 
-use frost::gl7_automation::{phase1_stepdown_step, pump3_phase3_step, pump_control_step, read_latest_temps, retry_on_busy, switch_control_step, RollingAverage};
+use frost::gl7_automation::{phase1_stepdown_step, pump3_phase3_step, pump_control_step, pump_hard_limit_check, read_latest_temps, retry_on_busy, stage_4k_limit_check, switch_control_step, RollingAverage};
 use std::io::Write;
 use std::time::Duration;
 
@@ -250,8 +250,8 @@ fn pump3_floor_respected() {
 
 // ── pump3_phase3_step ──────────────────────────────────────────────────────────
 //
-// Phase 3 3-pump control: four tiers — emergency (<40K), below lower limit,
-// above upper limit, and in-range predictive lookahead.
+// Phase 3 3-pump control: five tiers — emergency (<40K), below lower limit,
+// above upper limit, and in-range predictive lookahead for both bounds.
 
 /// Emergency tier: 3-pump below 40 K → +10%.
 #[test]
@@ -287,18 +287,18 @@ fn pump3_phase3_below_lower_stable_no_action() {
     assert!(pump3_phase3_step(43.0, -0.05, 40.0).is_none());
 }
 
-/// Above upper limit (> 55 K) → −5%.
+/// Above Phase 3 hot threshold (> 50 K) → −10%.
 #[test]
-fn pump3_phase3_above_upper_reduces_by_5pct() {
-    let (new_out, _) = pump3_phase3_step(57.0, 0.0, 40.0).expect("should adjust");
-    assert!((new_out - 35.0).abs() < 1e-9, "expected 35.0, got {new_out}");
+fn pump3_phase3_above_upper_reduces_by_10pct() {
+    let (new_out, _) = pump3_phase3_step(52.0, 0.0, 60.0).expect("should adjust");
+    assert!((new_out - 50.0).abs() < 1e-9, "expected 50.0, got {new_out}");
 }
 
 /// In range, falling slowly enough that 2-min lookahead is still above 45 K → no action.
 #[test]
 fn pump3_phase3_in_range_slow_fall_no_action() {
-    // 50 K − 0.5 K/min × 2 min = 49 K, still above 45 K
-    assert!(pump3_phase3_step(50.0, -0.5, 40.0).is_none());
+    // 48 K − 0.5 K/min × 2 min = 47 K, still above 45 K and below 50 K
+    assert!(pump3_phase3_step(48.0, -0.5, 40.0).is_none());
 }
 
 /// In range, but predicted to exit in 1–2 min → +5% (moderate pre-emption).
@@ -326,9 +326,34 @@ fn pump3_phase3_clamps_at_100pct() {
     assert!((new_out - 100.0).abs() < 1e-9, "expected 100.0 (ceiling), got {new_out}");
 }
 
+/// In range, rising fast — predicted above 50 K in < 1 min → −5%.
+#[test]
+fn pump3_phase3_in_range_predicted_above_upper_in_1min_reduces_5pct() {
+    // 49 K + 2.0 K/min × 1 min = 51 K > 50 K
+    let (new_out, reason) = pump3_phase3_step(49.0, 2.0, 50.0).expect("should adjust");
+    assert!((new_out - 45.0).abs() < 1e-9, "expected 45.0, got {new_out}");
+    assert!(reason.contains("above 50 K in < 1 min"), "expected 'above 50 K in < 1 min', got '{reason}'");
+}
+
+/// In range, rising — predicted above 50 K in 1–2 min → −5%.
+#[test]
+fn pump3_phase3_in_range_predicted_above_upper_in_2min_reduces_5pct() {
+    // 49 K + 0.7 K/min × 1 min = 49.7 K (still under), × 2 min = 50.4 K > 50 K
+    let (new_out, reason) = pump3_phase3_step(49.0, 0.7, 50.0).expect("should adjust");
+    assert!((new_out - 45.0).abs() < 1e-9, "expected 45.0, got {new_out}");
+    assert!(reason.contains("above 50 K in 1-2 min"), "expected 'above 50 K in 1-2 min', got '{reason}'");
+}
+
+/// In range, rising slowly — 2-min prediction still under 50 K → no action.
+#[test]
+fn pump3_phase3_in_range_slow_rise_no_action() {
+    // 47 K + 0.5 K/min × 2 min = 48 K < 50 K
+    assert!(pump3_phase3_step(47.0, 0.5, 40.0).is_none());
+}
+
 // ── switch_control_step ────────────────────────────────────────────────────────
 //
-// 4-switch Output 3 regulation: keep switch_k in [20 K, 22 K] using ±2% steps,
+// 4-switch Output 3 regulation: keep switch_k in [20 K, 22 K] using ±5% steps,
 // clamped to [20%, 45%].
 
 /// Temperature in range [20 K, 22 K] — no adjustment.
@@ -339,19 +364,19 @@ fn switch_in_range_no_adjustment() {
     assert!(switch_control_step(22.0, 40.0).is_none());
 }
 
-/// Temperature above 22 K — reduce Output 3 by 2%.
+/// Temperature above 22 K — reduce Output 3 by 5%.
 #[test]
 fn switch_too_hot_reduces_output() {
     let (new_out, reason) = switch_control_step(23.0, 40.0).expect("should adjust");
-    assert!((new_out - 38.0).abs() < 1e-9, "expected 38.0, got {new_out}");
+    assert!((new_out - 35.0).abs() < 1e-9, "expected 35.0, got {new_out}");
     assert!(reason.contains("above"), "expected 'above' in reason, got '{reason}'");
 }
 
-/// Temperature below 20 K — increase Output 3 by 2%.
+/// Temperature below 20 K — increase Output 3 by 5%.
 #[test]
 fn switch_too_cold_increases_output() {
-    let (new_out, reason) = switch_control_step(19.0, 40.0).expect("should adjust");
-    assert!((new_out - 42.0).abs() < 1e-9, "expected 42.0, got {new_out}");
+    let (new_out, reason) = switch_control_step(19.0, 35.0).expect("should adjust");
+    assert!((new_out - 40.0).abs() < 1e-9, "expected 40.0, got {new_out}");
     assert!(reason.contains("below"), "expected 'below' in reason, got '{reason}'");
 }
 
@@ -946,4 +971,70 @@ fn phase1_stepdown_sequential_steps_reach_floor() {
     }
     // One more call at floor should return None.
     assert_eq!(phase1_stepdown_step(threshold + 1.0, threshold, out, floor), None);
+}
+
+// ── pump_hard_limit_check ──────────────────────────────────────────────────────
+
+#[test]
+fn pump_hard_limit_below_threshold_returns_none() {
+    // 64.9 K is below the 65 K hard limit — no action.
+    assert_eq!(pump_hard_limit_check(64.9, 80.0), None);
+}
+
+#[test]
+fn pump_hard_limit_exactly_at_threshold_returns_none() {
+    // The limit is strictly greater-than, so exactly 65 K is not triggered.
+    assert_eq!(pump_hard_limit_check(65.0, 80.0), None);
+}
+
+#[test]
+fn pump_hard_limit_above_threshold_cuts_output_by_20() {
+    // 66 K > 65 K, output 80% → should drop to 60%.
+    assert_eq!(pump_hard_limit_check(66.0, 80.0), Some(60.0));
+}
+
+#[test]
+fn pump_hard_limit_clamps_to_zero() {
+    // Output already at 15% → 15 - 20 = -5, clamped to 0.
+    assert_eq!(pump_hard_limit_check(70.0, 15.0), Some(0.0));
+}
+
+#[test]
+fn pump_hard_limit_already_at_zero_returns_none() {
+    // Output is 0% — cutting by 20% produces no effective change.
+    assert_eq!(pump_hard_limit_check(70.0, 0.0), None);
+}
+
+// ── stage_4k_limit_check ──────────────────────────────────────────────────────
+
+#[test]
+fn stage_4k_limit_below_threshold_returns_none() {
+    assert_eq!(stage_4k_limit_check(11.9, 50.0, 0.0), None);
+}
+
+#[test]
+fn stage_4k_limit_exactly_at_threshold_returns_none() {
+    assert_eq!(stage_4k_limit_check(12.0, 50.0, 0.0), None);
+}
+
+#[test]
+fn stage_4k_limit_above_threshold_cuts_output_by_10() {
+    // 13 K > 12 K, output 50% → drops to 40%.
+    assert_eq!(stage_4k_limit_check(13.0, 50.0, 0.0), Some(40.0));
+}
+
+#[test]
+fn stage_4k_limit_respects_floor() {
+    // Output 8% with floor 10%: (8 - 10) = -2, clamped to 10% floor.
+    // 10% == 8% produces no effective change above EPSILON, so None.
+    // Actually 10.0 - 8.0 = 2.0 > 0.001, but we're clamping (8-10) to 10.
+    // new_out = (8.0 - 10.0).max(10.0) = (-2.0).max(10.0) = 10.0
+    // |10.0 - 8.0| = 2.0 > EPSILON → Some(10.0)
+    assert_eq!(stage_4k_limit_check(13.0, 8.0, 10.0), Some(10.0));
+}
+
+#[test]
+fn stage_4k_limit_already_at_floor_returns_none() {
+    // Output is exactly at the floor — no effective change possible.
+    assert_eq!(stage_4k_limit_check(13.0, 10.0, 10.0), None);
 }
