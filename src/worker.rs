@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,7 @@ use crate::compressor::CryomechController;
 use crate::lakeshore350::LakeShore350Controller;
 use crate::lakeshore370::LakeShore370Controller;
 use crate::lakeshore625::LakeShore625Controller;
+use crate::record_temps::{start_recording_loop, TemperatureRecord};
 
 // ── Button-state persistence (lock-file pattern) ───────────────
 //
@@ -22,8 +24,13 @@ use crate::lakeshore625::LakeShore625Controller;
 // so they survive process restarts.  Existence == active; absence == inactive.
 // The `_at` variants accept an explicit path for test isolation.
 
-pub const COMPRESSOR_INTENT_PATH: &str = "state/.compressor_intent";
+pub const COMPRESSOR_INTENT_PATH:  &str = "state/.compressor_intent";
+pub const HEATSWITCH_OPEN_PATH:    &str = "state/.heatswitch_open";
 pub const ADR_RAMP_RUNNING_PATH:   &str = "state/.adr_ramp_running";
+pub const ADR_RAMP_LOG_PATH:       &str = "state/.adr_ramp_log";
+pub const ADR_RAMP_STATUS_PATH:    &str = "state/.adr_ramp_status";
+pub const ADR_RAMP_STOP_PATH:      &str = "state/.adr_ramp_stop_request";
+pub const ADR_RAMP_RESULT_PATH:    &str = "state/.adr_ramp_result";
 
 fn ensure_parent(path: &Path) {
     if let Some(parent) = path.parent() {
@@ -56,26 +63,106 @@ pub fn is_compressor_intent() -> bool {
     is_compressor_intent_at(Path::new(COMPRESSOR_INTENT_PATH))
 }
 
-/// Write or remove the ADR-ramp lock file.
-pub fn set_adr_ramp_persisted_at(path: &Path, running: bool) {
-    if running {
-        ensure_parent(path);
-        let _ = fs::write(path, "");
-    } else {
-        let _ = fs::remove_file(path);
-    }
+/// Write the ADR-ramp lock file, storing the subprocess PID.
+pub fn set_adr_ramp_persisted_at(path: &Path, pid: u32) {
+    ensure_parent(path);
+    let _ = fs::write(path, pid.to_string());
 }
 
-pub fn set_adr_ramp_persisted(running: bool) {
-    set_adr_ramp_persisted_at(Path::new(ADR_RAMP_RUNNING_PATH), running);
+pub fn set_adr_ramp_persisted(pid: u32) {
+    set_adr_ramp_persisted_at(Path::new(ADR_RAMP_RUNNING_PATH), pid);
 }
 
+pub fn clear_adr_ramp_persisted_at(path: &Path) {
+    let _ = fs::remove_file(path);
+}
+
+pub fn clear_adr_ramp_persisted() {
+    clear_adr_ramp_persisted_at(Path::new(ADR_RAMP_RUNNING_PATH));
+}
+
+#[allow(dead_code)]
 pub fn is_adr_ramp_persisted_at(path: &Path) -> bool {
     path.exists()
 }
 
+#[allow(dead_code)]
 pub fn is_adr_ramp_persisted() -> bool {
     is_adr_ramp_persisted_at(Path::new(ADR_RAMP_RUNNING_PATH))
+}
+
+/// Returns the PID stored in the ADR-ramp lock file **only if that process is still running**.
+pub fn get_adr_ramp_pid_at(path: &Path) -> Option<u32> {
+    let pid = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())?;
+    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        Some(pid)
+    } else {
+        let _ = fs::remove_file(path);
+        None
+    }
+}
+
+pub fn get_adr_ramp_pid() -> Option<u32> {
+    get_adr_ramp_pid_at(Path::new(ADR_RAMP_RUNNING_PATH))
+}
+
+/// Write the GL7 cooldown lock file, storing the subprocess PID.
+pub const GL7_COOLDOWN_RUNNING_PATH: &str = "state/.gl7_cooldown_running";
+
+pub fn set_gl7_cooldown_persisted(pid: u32) {
+    ensure_parent(Path::new(GL7_COOLDOWN_RUNNING_PATH));
+    let _ = fs::write(GL7_COOLDOWN_RUNNING_PATH, pid.to_string());
+}
+
+pub fn clear_gl7_cooldown_persisted() {
+    let _ = fs::remove_file(GL7_COOLDOWN_RUNNING_PATH);
+}
+
+/// GL7 output-percentage state file written by the cooldown subprocess so the
+/// worker can display live percentages without polling the LS350 port directly.
+/// Format: four space-separated f64 values representing outputs 1–4.
+pub const GL7_OUTPUTS_PATH: &str = "state/.gl7_outputs";
+
+pub fn write_gl7_output_state(outputs: [f64; 4]) {
+    ensure_parent(Path::new(GL7_OUTPUTS_PATH));
+    let content = format!("{} {} {} {}", outputs[0], outputs[1], outputs[2], outputs[3]);
+    let _ = fs::write(GL7_OUTPUTS_PATH, content);
+}
+
+pub fn read_gl7_output_state() -> Option<[f64; 4]> {
+    let content = fs::read_to_string(GL7_OUTPUTS_PATH).ok()?;
+    let vals: Vec<f64> = content.split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if vals.len() == 4 {
+        Some([vals[0], vals[1], vals[2], vals[3]])
+    } else {
+        None
+    }
+}
+
+pub fn clear_gl7_output_state() {
+    let _ = fs::remove_file(GL7_OUTPUTS_PATH);
+}
+
+/// Returns the PID stored in the GL7 cooldown lock file **only if that
+/// process is still running**.  A dead process cannot have cleared the
+/// file itself (it crashed), so this check prevents a stale lock from
+/// permanently suppressing GL7 and temperature polls.
+pub fn get_gl7_cooldown_pid() -> Option<u32> {
+    let pid = fs::read_to_string(GL7_COOLDOWN_RUNNING_PATH)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())?;
+    // /proc/<pid> exists for the lifetime of the process on Linux.
+    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        Some(pid)
+    } else {
+        // Process is gone — clean up the stale lock file.
+        let _ = fs::remove_file(GL7_COOLDOWN_RUNNING_PATH);
+        None
+    }
 }
 
 // ── Shared data types ──────────────────────────────────────────
@@ -135,6 +222,16 @@ pub struct DeviceSnapshot {
     pub temperatures:     TemperatureReadings,
     pub last_temp_update: Option<Instant>,
 
+    // ── Temperature recording ─────────────────────────────────
+    pub recording_active:       bool,
+    pub recording_csv_path:     Option<String>,
+    /// Drained by GUI each frame: Some(Ok(path)) = started, Some(Err) = failed.
+    pub recording_start_result: Option<Result<String, String>>,
+
+    // ── GL7 cooldown ──────────────────────────────────────────
+    /// True while the GL7 cooldown subprocess is running (survives GUI restarts).
+    pub gl7_cooldown_active: bool,
+
     // ── ADR ramp ──────────────────────────────────────────────
     pub adr_ramp_running: bool,
     pub adr_ramp_started: Option<Instant>,
@@ -143,9 +240,8 @@ pub struct DeviceSnapshot {
     pub adr_log_lines:    Vec<String>,
     /// Live-updating status line (countdown / polling readout); empty when idle.
     pub adr_status_line:  String,
-    /// Set on startup when the ADR-ramp lock file was present but no ramp is running.
-    /// Signals "ramp was interrupted at last close"; cleared when user starts a new ramp.
-    pub adr_ramp_interrupted: bool,
+    /// Set when the user manually stops the ramp; suppresses the thread's result write.
+    pub adr_ramp_was_stopped: bool,
 }
 
 impl Default for DeviceSnapshot {
@@ -177,12 +273,16 @@ impl Default for DeviceSnapshot {
             gl7_set_results:  vec![None; 4],
             temperatures:     TemperatureReadings::default(),
             last_temp_update: None,
+            recording_active:       false,
+            recording_csv_path:     None,
+            recording_start_result: None,
+            gl7_cooldown_active: false,
             adr_ramp_running: false,
             adr_ramp_started: None,
             adr_ramp_result:  None,
             adr_log_lines:    Vec::new(),
             adr_status_line:  String::new(),
-            adr_ramp_interrupted: false,
+            adr_ramp_was_stopped: false,
         }
     }
 }
@@ -193,7 +293,12 @@ pub enum GuiCommand {
     StartCompressor,
     StopCompressor,
     SetGl7Output { output: u8, pct: f64 },
-    RunAdrRamp   { rate: f64, current: f64, soak_mins: u64 },
+    RunAdrRamp,
+    StopAdrRamp,
+    StartRecording { interval_secs: u64, output_dir: String, resume_path: Option<String> },
+    StopRecording,
+    /// Update `DeviceSnapshot::gl7_cooldown_active` to reflect subprocess state.
+    Gl7CooldownActive(bool),
 }
 
 // ── Public worker handle ───────────────────────────────────────
@@ -208,18 +313,23 @@ impl SerialWorker {
     pub fn spawn(ctx: egui::Context) -> Self {
         let snapshot = Arc::new(Mutex::new(DeviceSnapshot::default()));
 
+        // Check for a recording lock file before the startup block so we can
+        // auto-resume recording after all other state is restored.
+        let was_recording = crate::record_temps::is_recording_active();
+
         // Restore button state from lock files written during the previous session.
         {
-            let mut s = snapshot.lock().unwrap();
+            let mut s = snapshot.lock().unwrap_or_else(|p| p.into_inner());
             // Seed compressor_running from the intent file so the button shows the
             // correct label immediately, before the first 30-second poll completes.
             s.compressor_running = is_compressor_intent();
-            // Flag an interrupted ADR ramp so the GUI can warn the user.
-            if is_adr_ramp_persisted() {
-                s.adr_ramp_interrupted = true;
-                // Clear the lock file — one warning per interruption is enough.
-                set_adr_ramp_persisted(false);
-            }
+            // Restore ADR ramp state: if the subprocess is still alive (PID check),
+            // show the Stop button immediately.  A dead process cannot have cleared
+            // the file itself, so get_adr_ramp_pid() detects and removes stale files.
+            s.adr_ramp_running = get_adr_ramp_pid().is_some();
+            // Restore GL7 cooldown state: if the lock file exists the subprocess
+            // was running when the GUI last closed.
+            s.gl7_cooldown_active = get_gl7_cooldown_pid().is_some();
         }
 
         let (cmd_tx, cmd_rx) = channel::<GuiCommand>();
@@ -227,7 +337,21 @@ impl SerialWorker {
         let snap = Arc::clone(&snapshot);
         std::thread::spawn(move || worker_loop(snap, cmd_rx, ctx));
 
-        Self { snapshot, cmd_tx }
+        let worker = Self { snapshot, cmd_tx };
+
+        // Auto-resume recording if it was active when the GUI last closed.
+        // Read the CSV path stored in the lock file so recording resumes in the
+        // same file rather than creating a new one on each launch.
+        if was_recording {
+            let resume_path = crate::record_temps::get_recording_active_path();
+            worker.send(GuiCommand::StartRecording {
+                interval_secs: 30,
+                output_dir: "temps".to_string(),
+                resume_path,
+            });
+        }
+
+        worker
     }
 
     /// Non-blocking send — fire and forget.
@@ -249,6 +373,8 @@ struct WorkerState {
     last_magnet_poll:     Instant,
     last_gl7_poll:        Instant,
     last_temp_poll:       Instant,
+    recording_stop_flag:  Option<Arc<AtomicBool>>,
+    adr_ramp_log_offset:  usize,
 }
 
 impl WorkerState {
@@ -265,6 +391,8 @@ impl WorkerState {
             last_magnet_poll:     now - Duration::from_secs(22),
             last_gl7_poll:        now - Duration::from_secs(12),
             last_temp_poll:       now - Duration::from_secs(2),
+            recording_stop_flag:  None,
+            adr_ramp_log_offset:  0,
         }
     }
 }
@@ -283,6 +411,21 @@ fn worker_loop(
             ctx.request_repaint();
         }
 
+        // Sync GL7 cooldown state from the lock file so that cooldowns started
+        // from the CLI are reflected in the GUI without a restart.
+        {
+            let lock_active = get_gl7_cooldown_pid().is_some();
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            if s.gl7_cooldown_active != lock_active {
+                s.gl7_cooldown_active = lock_active;
+                drop(s);
+                ctx.request_repaint();
+            }
+        }
+
+        // Poll ADR ramp log/status files and detect natural subprocess exit.
+        poll_adr_ramp(&mut state, &snap, &ctx);
+
         // Periodic polls — each blocks this thread, but the GUI reads the
         // snapshot without waiting so it stays fully responsive.
         if state.last_compressor_poll.elapsed() >= POLL_INTERVAL {
@@ -298,15 +441,41 @@ fn worker_loop(
         }
 
         if state.last_gl7_poll.elapsed() >= POLL_INTERVAL {
-            poll_gl7(&mut state, &snap);
+            // The cooldown subprocess owns the LS350 port exclusively — skip
+            // hardware polling to avoid exclusive-lock errors.  Instead, read
+            // the output-percentage state file the subprocess maintains so the
+            // GUI still shows live values during a cooldown.
+            let cooldown_active = snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_cooldown_active;
+            if cooldown_active {
+                if let Some(pcts) = read_gl7_output_state() {
+                    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                    for (i, &pct) in pcts.iter().enumerate() {
+                        s.gl7_polled_pct[i] = Some(pct);
+                    }
+                    s.last_gl7_update = Some(Instant::now());
+                }
+            } else {
+                poll_gl7(&mut state, &snap);
+            }
             state.last_gl7_poll = Instant::now();
             ctx.request_repaint();
         }
 
         if state.last_temp_poll.elapsed() >= POLL_INTERVAL {
-            poll_temps(&mut state, &snap);
+            // Skip when the recording thread or GL7 cooldown subprocess owns the
+            // LS350/LS370 ports.  Both set exclusive port locks; a simultaneous
+            // open from the GUI worker produces hard failures.
+            // - Recording active: recording callback writes fresh temps instead.
+            // - GL7 cooldown active: subprocess writes LS350 outputs; concurrent
+            //   reads from this thread will clash on the exclusive port lock.
+            let cooldown_active = snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_cooldown_active;
+            if state.recording_stop_flag.is_none() && !cooldown_active {
+                poll_temps(&mut state, &snap);
+                ctx.request_repaint();
+            }
+            // Always advance the timer so this block fires exactly once per
+            // interval — even when the poll is skipped.
             state.last_temp_poll = Instant::now();
-            ctx.request_repaint();
         }
 
         // Brief sleep so we're not busy-spinning between polls.
@@ -321,20 +490,36 @@ fn execute_command(cmd: GuiCommand, state: &mut WorkerState, snap: &Arc<Mutex<De
         GuiCommand::StartCompressor => {
             let result = state.compressor.start_compressor().map(|_| ());
             poll_compressor(state, snap);
-            snap.lock().unwrap().compressor_cmd_result = Some(result);
+            snap.lock().unwrap_or_else(|p| p.into_inner()).compressor_cmd_result = Some(result);
         }
 
         GuiCommand::StopCompressor => {
             let result = state.compressor.stop_compressor().map(|_| ());
             poll_compressor(state, snap);
-            snap.lock().unwrap().compressor_cmd_result = Some(result);
+            snap.lock().unwrap_or_else(|p| p.into_inner()).compressor_cmd_result = Some(result);
         }
 
         GuiCommand::SetGl7Output { output, pct } => {
-            let idx = (output as usize).saturating_sub(1);
-            state.ls350.set_output_percent(output, pct);
-            if let Some(err) = state.ls350.error_message.clone() {
-                snap.lock().unwrap().gl7_set_results[idx] = Some(Err(err));
+            if !(1..=4).contains(&output) {
+                eprintln!("[worker] SetGl7Output: output {output} out of range (must be 1–4); ignoring");
+                return;
+            }
+            let idx = (output as usize) - 1;
+            // Retry indefinitely on "Device or resource busy" — the GL7 subprocess
+            // may still hold the port fd immediately after being killed.  Any other
+            // error (write failure, bad port, etc.) breaks out immediately.
+            let set_result: Result<(), String> = loop {
+                state.ls350.set_output_percent(output, pct);
+                match state.ls350.error_message.clone() {
+                    Some(e) if e.contains("Device or resource busy") => {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                    Some(e) => break Err(e),
+                    None    => break Ok(()),
+                }
+            };
+            if let Err(err) = set_result {
+                snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_set_results[idx] = Some(Err(err));
             } else {
                 state.ls350.query_output_percentages(output);
                 let (l1, l2, new_pct) = if state.ls350.error_message.is_none() {
@@ -348,67 +533,168 @@ fn execute_command(cmd: GuiCommand, state: &mut WorkerState, snap: &Arc<Mutex<De
                 } else {
                     (String::new(), String::new(), None)
                 };
-                let mut s = snap.lock().unwrap();
+                let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
                 s.gl7_output_lines[idx] = (l1, l2);
                 s.gl7_polled_pct[idx]   = new_pct;
                 s.gl7_set_results[idx]  = Some(Ok(()));
+                s.last_gl7_update       = Some(Instant::now());
             }
         }
 
-        GuiCommand::RunAdrRamp { rate, current, soak_mins } => {
+        GuiCommand::StartRecording { interval_secs, output_dir, resume_path } => {
+            // Guard: ignore if already recording.
+            {
+                let s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                if s.recording_active { return; }
+            }
+            let snap_cb = Arc::clone(snap);
+            let ctx_cb  = ctx.clone();
+            match start_recording_loop(interval_secs, &output_dir, resume_path, move |rec| {
+                let temps = temps_from_record(rec);
+                let mut s = snap_cb.lock().unwrap_or_else(|p| p.into_inner());
+                s.temperatures     = temps;
+                s.last_temp_update = Some(Instant::now());
+                drop(s);
+                ctx_cb.request_repaint();
+            }) {
+                Ok((path, stop_flag)) => {
+                    state.recording_stop_flag = Some(stop_flag);
+                    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                    s.recording_active       = true;
+                    s.recording_csv_path     = Some(path.clone());
+                    s.recording_start_result = Some(Ok(path));
+                }
+                Err(e) => {
+                    snap.lock().unwrap_or_else(|p| p.into_inner())
+                        .recording_start_result = Some(Err(e));
+                }
+            }
+        }
+
+        GuiCommand::StopRecording => {
+            if let Some(flag) = state.recording_stop_flag.take() {
+                flag.store(true, Ordering::Relaxed);
+            }
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            s.recording_active = false;
+        }
+
+        GuiCommand::StopAdrRamp => {
+            // Subprocess already killed by GUI. Set magnet to 0 and clean up.
+            let _ = state.ls625.set_current(0.0);
+            clear_adr_ramp_persisted();
+            let _ = fs::remove_file(ADR_RAMP_STOP_PATH);
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            s.adr_ramp_running     = false;
+            s.adr_ramp_was_stopped = true;
+            s.adr_status_line.clear();
+            state.adr_ramp_log_offset = 0;
+        }
+
+        GuiCommand::Gl7CooldownActive(active) => {
+            snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_cooldown_active = active;
+        }
+
+        GuiCommand::RunAdrRamp => {
             // Guard: ignore if a ramp is already in progress.
             {
-                let s = snap.lock().unwrap();
-                if s.adr_ramp_running {
-                    return;
-                }
+                let s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                if s.adr_ramp_running { return; }
             }
-            set_adr_ramp_persisted(true);
-            {
-                let mut s = snap.lock().unwrap();
-                s.adr_ramp_running    = true;
-                s.adr_ramp_started    = Some(Instant::now());
-                s.adr_ramp_result     = None;
-                s.adr_ramp_interrupted = false;
-                s.adr_log_lines.clear();
-                s.adr_status_line.clear();
-            }
-
-            // Channel for live progress messages from the ramp thread to the GUI.
-            let (log_tx, log_rx) = std::sync::mpsc::channel::<crate::adr_ramping::AdrLogMsg>();
-
-            // Relay thread: receives log messages and writes them into the snapshot.
-            let snap_relay = Arc::clone(snap);
-            let ctx_relay  = ctx.clone();
-            let relay = std::thread::spawn(move || {
-                use crate::adr_ramping::AdrLogMsg;
-                while let Ok(msg) = log_rx.recv() {
-                    let mut s = snap_relay.lock().unwrap();
-                    match msg {
-                        AdrLogMsg::Line(line)     => s.adr_log_lines.push(line),
-                        AdrLogMsg::Status(status) => s.adr_status_line = status,
-                    }
-                    drop(s);
-                    ctx_relay.request_repaint();
-                }
-            });
-
-            // Ramp thread: runs the sequence, drops log_tx when done (closes channel).
-            let snap_ramp = Arc::clone(snap);
-            let ctx_ramp  = ctx.clone();
-            std::thread::spawn(move || {
-                let result = crate::adr_ramping::run_adr_ramp(rate, current, soak_mins, Some(&log_tx));
-                drop(log_tx);           // signal relay to drain and exit
-                let _ = relay.join();   // wait for all messages to flush into snapshot
-                set_adr_ramp_persisted(false);
-                let mut s = snap_ramp.lock().unwrap();
-                s.adr_ramp_running = false;
-                s.adr_ramp_result  = Some(result);
-                s.adr_status_line.clear();
-                drop(s);
-                ctx_ramp.request_repaint();
-            });
+            // The GUI has already spawned the subprocess.  Clear old log/status
+            // files and flip the snapshot flag so the Stop button shows immediately.
+            let _ = fs::write(ADR_RAMP_LOG_PATH, "");
+            let _ = fs::write(ADR_RAMP_STATUS_PATH, "");
+            let _ = fs::remove_file(ADR_RAMP_RESULT_PATH);
+            let _ = fs::remove_file(ADR_RAMP_STOP_PATH);
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            s.adr_ramp_running     = true;
+            s.adr_ramp_started     = Some(Instant::now());
+            s.adr_ramp_result      = None;
+            s.adr_ramp_was_stopped = false;
+            s.adr_log_lines.clear();
+            s.adr_status_line.clear();
+            state.adr_ramp_log_offset = 0;
         }
+    }
+}
+
+// ── ADR ramp file polling ──────────────────────────────────────
+
+fn poll_adr_ramp(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>, ctx: &egui::Context) {
+    let ramp_running = snap.lock().unwrap_or_else(|p| p.into_inner()).adr_ramp_running;
+    if !ramp_running {
+        return;
+    }
+
+    // Poll log file for new lines since last read.
+    if let Ok(content) = fs::read_to_string(ADR_RAMP_LOG_PATH) {
+        if content.len() > state.adr_ramp_log_offset {
+            let new_lines: Vec<String> = content[state.adr_ramp_log_offset..]
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+            if !new_lines.is_empty() {
+                snap.lock().unwrap_or_else(|p| p.into_inner())
+                    .adr_log_lines.extend(new_lines);
+                ctx.request_repaint();
+            }
+            state.adr_ramp_log_offset = content.len();
+        }
+    }
+
+    // Poll status file (live countdown / polling readout).
+    if let Ok(status) = fs::read_to_string(ADR_RAMP_STATUS_PATH) {
+        let status = status.trim_end_matches('\n').to_string();
+        let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+        if s.adr_status_line != status {
+            s.adr_status_line = status;
+            drop(s);
+            ctx.request_repaint();
+        }
+    }
+
+    // Detect natural subprocess exit via PID liveness check.
+    if get_adr_ramp_pid().is_none() {
+        let result: Result<(), String> = match fs::read_to_string(ADR_RAMP_RESULT_PATH) {
+            Ok(s) if s.trim() == "ok"           => Ok(()),
+            Ok(s) if s.starts_with("error:")    => Err(s[6..].trim().to_string()),
+            _                                    => Ok(()),
+        };
+        let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+        if s.adr_ramp_running {
+            s.adr_ramp_running = false;
+            if !s.adr_ramp_was_stopped {
+                s.adr_ramp_result = Some(result);
+            }
+            s.adr_status_line.clear();
+            state.adr_ramp_log_offset = 0;
+        }
+        drop(s);
+        ctx.request_repaint();
+    }
+}
+
+// ── Recording helpers ──────────────────────────────────────────
+
+fn format_opt_kelvin(v: Option<f64>) -> String {
+    match v {
+        Some(k) if k > 0.0 => format!("{k:.4} K"),
+        Some(_)             => "T_OVER".to_string(),
+        None                => "---".to_string(),
+    }
+}
+
+fn temps_from_record(rec: &TemperatureRecord) -> TemperatureReadings {
+    TemperatureReadings {
+        ls350_a:  format_opt_kelvin(rec.a_temp_k),
+        ls350_b:  format_opt_kelvin(rec.b_temp_k),
+        ls350_c:  format_opt_kelvin(rec.c_temp_k),
+        ls350_d2: format_opt_kelvin(rec.d2_temp_k),
+        ls350_d3: format_opt_kelvin(rec.d3_temp_k),
+        ls350_d4: format_opt_kelvin(rec.d4_temp_k),
+        ls350_d5: format_opt_kelvin(rec.d5_temp_k),
+        ls370_1:  format_opt_kelvin(rec.ls370_temp_k),
     }
 }
 
@@ -416,7 +702,7 @@ fn execute_command(cmd: GuiCommand, state: &mut WorkerState, snap: &Arc<Mutex<De
 
 fn poll_compressor(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>) {
     state.compressor.get_status();
-    let mut s = snap.lock().unwrap();
+    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(e) = state.compressor.error_message.clone() {
         s.compressor_status  = format!("Error: {e}");
         s.compressor_running = false;
@@ -480,7 +766,7 @@ fn poll_magnet(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>) {
     let voltage = state.ls625.get_voltage().unwrap_or_default();
     let field   = state.ls625.get_field().unwrap_or_default();
 
-    let mut s = snap.lock().unwrap();
+    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
     s.magnet_limits  = limits_str;
     s.magnet_quench  = quench;
     s.magnet_current = current;
@@ -498,8 +784,12 @@ fn poll_magnet(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>) {
 }
 
 fn poll_gl7(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>) {
-    let mut lines: Vec<(String, String)> = vec![(String::new(), String::new()); 4];
-    let mut pcts:  Vec<Option<f64>>      = vec![None; 4];
+    // Seed from the last known-good values so a transient serial failure on
+    // one output doesn't wipe out the other successfully-polled values.
+    let (mut lines, mut pcts) = {
+        let s = snap.lock().unwrap_or_else(|p| p.into_inner());
+        (s.gl7_output_lines.clone(), s.gl7_polled_pct.clone())
+    };
 
     for (i, &output_num) in [1u8, 2, 3, 4].iter().enumerate() {
         state.ls350.query_output_percentages(output_num);
@@ -510,9 +800,10 @@ fn poll_gl7(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>) {
             pcts[i]  = l1.split_whitespace().last().and_then(|s| s.parse::<f64>().ok());
             lines[i] = (l1, l2);
         }
+        // On failure: leave pcts[i] and lines[i] at their previous values.
     }
 
-    let mut s = snap.lock().unwrap();
+    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
     s.gl7_output_lines = lines;
     s.gl7_polled_pct   = pcts;
     s.last_gl7_update  = Some(Instant::now());
@@ -545,7 +836,7 @@ fn poll_temps(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>) {
         Err(e) => format!("ERROR ({e})"),
     };
 
-    let mut s = snap.lock().unwrap();
+    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
     s.temperatures = TemperatureReadings {
         ls350_a, ls350_b, ls350_c, ls350_d2, ls350_d3, ls350_d4, ls350_d5,
         ls370_1,

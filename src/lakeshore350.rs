@@ -145,8 +145,8 @@ impl FourHeadCalibration {
         
         // Sort by resistance (increasing order) as done in Python
         let mut pairs: Vec<(f64, f64)> = resistances.iter().zip(temperatures.iter()).map(|(&r, &t)| (r, t)).collect();
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
         let (sorted_resistances, sorted_temperatures): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
         
         Ok(Self {
@@ -228,8 +228,8 @@ impl PumpCalibration {
         
         // Sort by voltage (increasing order) as done in Python for interpolation
         let mut pairs: Vec<(f64, f64)> = voltages.iter().zip(temperatures.iter()).map(|(&v, &t)| (v, t)).collect();
-        pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+
         let (sorted_voltages, sorted_temperatures): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
         
         Ok(Self {
@@ -290,9 +290,6 @@ pub struct Ls350RecordingData {
     pub input_d2_sensor_v: Option<f64>,
     /// Input D2 (switch): calibrated temperature in K.
     pub input_d2_temp_k: Option<f64>,
-    /// Input D3 (4K stage): voltage in V.
-    #[allow(dead_code)]
-    pub input_d3_sensor_v: Option<f64>,
     /// Input D3 (4K stage): temperature in K (KRDG?).
     pub input_d3_temp_k: Option<f64>,
     /// Input D4 (3-pump): voltage in V.
@@ -490,55 +487,6 @@ impl LakeShore350Controller {
         Ok(r)
     }
 
-    /// `SRDG? <input>` — get raw sensor reading into `self.output`.
-    #[allow(dead_code)]
-    pub fn get_sensor(&mut self, input: &str) {
-        let input = input.to_uppercase();
-        if !ALL_INPUTS.contains(&input.as_str()) {
-            self.error_message = Some(format!(
-                "Invalid input '{}'. Must be one of: {}",
-                input, ALL_INPUTS.join(", ")
-            ));
-            return;
-        }
-        match self.read_sensor_raw(&input) {
-            Ok(r) => {
-                let unit = sensor_unit(&input);
-                self.output = if let Ok(v) = r.parse::<f64>() {
-                    format!("Input {input}: {v:.4} {unit}\n")
-                } else {
-                    format!("Input {input}: {r}\n")
-                };
-                self.error_message = None;
-            }
-            Err(e) => self.error_message = Some(e),
-        }
-    }
-
-    /// `KRDG? <input>` (with `RDGST?` check) — get temperature in Kelvin into `self.output`.
-    #[allow(dead_code)]
-    pub fn get_kelvin(&mut self, input: &str) {
-        let input = input.to_uppercase();
-        if !ALL_INPUTS.contains(&input.as_str()) {
-            self.error_message = Some(format!(
-                "Invalid input '{}'. Must be one of: {}",
-                input, ALL_INPUTS.join(", ")
-            ));
-            return;
-        }
-        match self.read_kelvin_raw(&input) {
-            Ok(r) => {
-                self.output = if let Ok(v) = r.parse::<f64>() {
-                    format!("Input {input}: {v:.4} K\n")
-                } else {
-                    format!("Input {input}: {r}\n")
-                };
-                self.error_message = None;
-            }
-            Err(e) => self.error_message = Some(e),
-        }
-    }
-
     /// Read A (3-head), B (ADR), C (4-head), D3 (4K stage), D4 (3-pump), and D5 (4-pump) and print sensor + Kelvin/calibrated for each.
     /// Mirrors the core of `lakeshore350 --all` for these six key inputs.
     pub fn get_all_readings(&mut self) {
@@ -706,9 +654,8 @@ impl LakeShore350Controller {
             self.pump_cal.as_ref()?.voltage_to_temperature(v)
         });
 
-        // ── Input D3 (4K stage): voltage V + KRDG K ───────────────────
-        let d3_sensor = self.read_sensor_raw("D3").ok().and_then(|s| s.parse::<f64>().ok());
-        let d3_temp   = self.read_kelvin_raw("D3").ok().and_then(|s| s.parse::<f64>().ok());
+        // ── Input D3 (4K stage): KRDG K ───────────────────────────────
+        let d3_temp = self.read_kelvin_raw("D3").ok().and_then(|s| s.parse::<f64>().ok());
 
         // ── Input D4 (3-pump): voltage V + pump calibrated K ──────────
         let d4_sensor = self.read_sensor_raw("D4").ok().and_then(|s| s.parse::<f64>().ok());
@@ -731,7 +678,6 @@ impl LakeShore350Controller {
             input_c_temp_k:     c_temp,
             input_d2_sensor_v:  d2_sensor,
             input_d2_temp_k:    d2_temp,
-            input_d3_sensor_v:  d3_sensor,
             input_d3_temp_k:    d3_temp,
             input_d4_sensor_v:  d4_sensor,
             input_d4_temp_k:    d4_temp,

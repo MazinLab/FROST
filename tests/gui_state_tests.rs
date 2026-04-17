@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use frost::worker::{
     set_compressor_intent_at, is_compressor_intent_at,
-    set_adr_ramp_persisted_at, is_adr_ramp_persisted_at,
+    set_adr_ramp_persisted_at, clear_adr_ramp_persisted_at, is_adr_ramp_persisted_at,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -123,23 +123,24 @@ fn compressor_intent_set_false_when_absent_is_no_op() {
 // ── ADR ramp lock file ────────────────────────────────────────────────────────
 
 #[test]
-fn adr_ramp_write_true_creates_file() {
+fn adr_ramp_write_pid_creates_file() {
     let path = tmp("adr_true");
     let _ = std::fs::remove_file(&path);
 
-    set_adr_ramp_persisted_at(&path, true);
-    assert!(path.exists(), "file must exist after set(true)");
+    set_adr_ramp_persisted_at(&path, 1234);
+    assert!(path.exists(), "file must exist after set(pid)");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "1234");
 
     cleanup(&path);
 }
 
 #[test]
-fn adr_ramp_write_false_removes_file() {
+fn adr_ramp_clear_removes_file() {
     let path = tmp("adr_false");
-    std::fs::write(&path, "").unwrap();
+    std::fs::write(&path, "1234").unwrap();
 
-    set_adr_ramp_persisted_at(&path, false);
-    assert!(!path.exists(), "file must be gone after set(false)");
+    clear_adr_ramp_persisted_at(&path);
+    assert!(!path.exists(), "file must be gone after clear");
 }
 
 #[test]
@@ -153,7 +154,7 @@ fn adr_ramp_missing_returns_false() {
 #[test]
 fn adr_ramp_present_returns_true() {
     let path = tmp("adr_present");
-    std::fs::write(&path, "").unwrap();
+    std::fs::write(&path, "1234").unwrap();
 
     assert!(is_adr_ramp_persisted_at(&path));
 
@@ -165,20 +166,20 @@ fn adr_ramp_roundtrip_start_then_complete() {
     let path = tmp("adr_roundtrip");
     let _ = std::fs::remove_file(&path);
 
-    set_adr_ramp_persisted_at(&path, true);
+    set_adr_ramp_persisted_at(&path, 5678);
     assert!(is_adr_ramp_persisted_at(&path), "should be set while ramp runs");
 
-    set_adr_ramp_persisted_at(&path, false);
+    clear_adr_ramp_persisted_at(&path);
     assert!(!is_adr_ramp_persisted_at(&path), "should be cleared when ramp completes");
 }
 
 #[test]
-fn adr_ramp_set_false_when_absent_is_no_op() {
+fn adr_ramp_clear_when_absent_is_no_op() {
     let path = tmp("adr_false_absent");
     let _ = std::fs::remove_file(&path);
 
     // Must not panic:
-    set_adr_ramp_persisted_at(&path, false);
+    clear_adr_ramp_persisted_at(&path);
     assert!(!path.exists());
 }
 
@@ -209,7 +210,7 @@ fn adr_ramp_creates_missing_parent_directory() {
     let _ = std::fs::remove_dir_all(parent);
     assert!(!parent.exists());
 
-    set_adr_ramp_persisted_at(&path, true);
+    set_adr_ramp_persisted_at(&path, 9999);
 
     assert!(parent.exists(), "parent directory must be created");
     assert!(path.exists(), "lock file must be created");
@@ -220,29 +221,31 @@ fn adr_ramp_creates_missing_parent_directory() {
 // ── Simulated restart scenario ────────────────────────────────────────────────
 //
 // Verifies the full lifecycle: ramp starts → lock file written → process dies
-// (simulated by keeping file) → new process reads file → flag set → file cleared.
+// (simulated by keeping file) → new process reads file → running state restored
+// (file NOT cleared) → user clicks Stop → file cleared.
 
 #[test]
-fn adr_ramp_restart_cycle_interrupted_flag_set_once() {
+fn adr_ramp_restart_cycle_restores_running_state() {
     let path = tmp("adr_restart");
     let _ = std::fs::remove_file(&path);
 
-    // Session 1: ramp starts
-    set_adr_ramp_persisted_at(&path, true);
+    // Session 1: ramp starts — lock file written with PID.
+    set_adr_ramp_persisted_at(&path, 4242);
     assert!(is_adr_ramp_persisted_at(&path));
 
     // Process dies mid-ramp — lock file remains.
 
-    // Session 2: startup reads lock file, sets interrupted flag, clears file.
-    let interrupted = is_adr_ramp_persisted_at(&path);
-    set_adr_ramp_persisted_at(&path, false); // clear so it's one-shot
+    // Session 2: startup reads lock file. is_adr_ramp_persisted_at checks existence only.
+    let was_persisted = is_adr_ramp_persisted_at(&path);
+    assert!(was_persisted, "lock file must still be present after restart");
+    assert!(is_adr_ramp_persisted_at(&path), "lock file must survive restart");
 
-    assert!(interrupted, "interrupted flag must be true on first restart");
-    assert!(!is_adr_ramp_persisted_at(&path), "lock file must be gone after startup");
+    // User clicks Stop (or ramp completes): lock file is cleared.
+    clear_adr_ramp_persisted_at(&path);
+    assert!(!is_adr_ramp_persisted_at(&path), "lock file must be gone after stop");
 
-    // Session 3: startup sees no lock file — no warning.
-    let interrupted_again = is_adr_ramp_persisted_at(&path);
-    assert!(!interrupted_again, "no spurious warning on second restart");
+    // Session 3: startup sees no lock file — button shows Start.
+    assert!(!is_adr_ramp_persisted_at(&path), "no spurious running state on clean restart");
 }
 
 #[test]

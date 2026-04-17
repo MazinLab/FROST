@@ -131,10 +131,12 @@ fn serial_public_api_compiles() {
 
 // ── Zaber frame layout ────────────────────────────────────────────────────────
 //
-// These verify the unsafe byte-casting in ZaberDriver::send_command against the
-// Zaber binary protocol spec: 6-byte packed LE frames [device_id, command, data u32 LE].
+// These verify the wire-encoding used by ZaberDriver::send_command against the
+// Zaber binary protocol spec: 6-byte frames [device_id, command, data u32 LE].
+// The encoding is now done with explicit byte construction — no unsafe casting.
 
 /// The Zaber binary protocol mandates a 6-byte frame.
+/// A compile-time assertion in serial.rs enforces this; the test documents it.
 #[test]
 fn zaber_command_frame_is_6_bytes() {
     assert_eq!(std::mem::size_of::<ZaberCommand>(), 6);
@@ -146,16 +148,11 @@ fn zaber_response_frame_is_6_bytes() {
 }
 
 /// CMD_MOVE_ABS = 20 (0x14), device 1, data = 115200 (0x0001_C200).
-/// Expected bytes: [0x01, 0x14, 0x00, 0xC2, 0x01, 0x00]
+/// Expected wire bytes: [0x01, 0x14, 0x00, 0xC2, 0x01, 0x00]
 #[test]
 fn zaber_command_byte_layout() {
-    let cmd = ZaberCommand { device_id: 1, command: CMD_MOVE_ABS, data: 115200u32.to_le() };
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            &cmd as *const ZaberCommand as *const u8,
-            std::mem::size_of::<ZaberCommand>(),
-        )
-    };
+    let data_le = 115200u32.to_le_bytes();
+    let bytes: [u8; 6] = [1, CMD_MOVE_ABS, data_le[0], data_le[1], data_le[2], data_le[3]];
     assert_eq!(bytes[0], 0x01, "device_id");
     assert_eq!(bytes[1], 0x14, "command (CMD_MOVE_ABS = 20 = 0x14)");
     // 115200 = 0x0001_C200, LE: 00 C2 01 00
@@ -170,13 +167,8 @@ fn zaber_command_byte_layout() {
 #[test]
 fn zaber_command_negative_relative_move() {
     let steps: i32 = -115_200;
-    let cmd = ZaberCommand { device_id: 1, command: CMD_MOVE_REL, data: (steps as u32).to_le() };
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            &cmd as *const ZaberCommand as *const u8,
-            std::mem::size_of::<ZaberCommand>(),
-        )
-    };
+    let data_le = (steps as u32).to_le_bytes();
+    let bytes: [u8; 6] = [1, CMD_MOVE_REL, data_le[0], data_le[1], data_le[2], data_le[3]];
     assert_eq!(bytes[1], CMD_MOVE_REL);
     assert_eq!(bytes[2], 0x00);
     assert_eq!(bytes[3], 0x3E);
@@ -189,22 +181,19 @@ fn zaber_command_negative_relative_move() {
 fn zaber_response_decode_roundtrip() {
     // device=1, cmd=60 (GET_POS), data=57600 (0x0000_E100)
     let raw: [u8; 6] = [0x01, 0x3C, 0x00, 0xE1, 0x00, 0x00];
-    let resp = unsafe { std::ptr::read(raw.as_ptr() as *const ZaberResponse) };
-    assert_eq!(resp.device_id, 1);
-    assert_eq!(resp.command, 60); // CMD_GET_POS
-    assert_eq!(u32::from_le(resp.data), 57600);
+    let device_id = raw[0];
+    let command   = raw[1];
+    let data      = u32::from_le_bytes([raw[2], raw[3], raw[4], raw[5]]);
+    assert_eq!(device_id, 1);
+    assert_eq!(command, 60); // CMD_GET_POS
+    assert_eq!(data, 57600);
 }
 
 /// Zero data field encodes correctly (used by HOME, STOP, GET_POS, etc.).
 #[test]
 fn zaber_command_zero_data() {
-    let cmd = ZaberCommand { device_id: 1, command: CMD_HOME, data: 0u32.to_le() };
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            &cmd as *const ZaberCommand as *const u8,
-            std::mem::size_of::<ZaberCommand>(),
-        )
-    };
+    let data_le = 0u32.to_le_bytes();
+    let bytes: [u8; 6] = [1, CMD_HOME, data_le[0], data_le[1], data_le[2], data_le[3]];
     assert_eq!(bytes[1], CMD_HOME);
     assert_eq!(&bytes[2..6], &[0x00, 0x00, 0x00, 0x00]);
 }

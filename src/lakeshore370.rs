@@ -274,9 +274,10 @@ impl LakeShore370Controller {
     pub fn get_heater_range(&mut self) {
         match crate::serial::scpi_query(&self.port, self.baud_rate, "HTRRNG?", "\r\n", 200) {
             Ok(r) if !r.is_empty() => {
-                let code = r.parse::<usize>().unwrap_or(usize::MAX);
-                let name = HEATER_RANGE_NAMES.get(code).copied().unwrap_or("Unknown");
-                self.output = format!("Heater range: {code} — {name}");
+                let name = r.parse::<usize>().ok()
+                    .and_then(|i| HEATER_RANGE_NAMES.get(i).copied())
+                    .unwrap_or("Unknown");
+                self.output = format!("Heater range: {r} — {name}");
                 self.error_message = None;
             }
             Ok(_) => self.error_message = Some("No response to HTRRNG?".to_string()),

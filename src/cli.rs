@@ -478,6 +478,80 @@ pub enum RecordTempsCmd {
     },
 }
 
+// ── ADR ramp subprocess helper ────────────────────────────────
+//
+// Runs the full ramp sequence as a persistent subprocess-compatible function:
+// writes a PID lock file so the GUI can track liveness across restarts, relays
+// all log messages to state files the worker polls, and checks a stop-request
+// file so the GUI can interrupt cleanly without signals.
+
+fn adr_ramp_subprocess(rate: f64, current: f64, soak_mins: u64) -> Result<(), String> {
+    use crate::worker::{
+        set_adr_ramp_persisted, clear_adr_ramp_persisted,
+        ADR_RAMP_LOG_PATH, ADR_RAMP_STATUS_PATH, ADR_RAMP_STOP_PATH, ADR_RAMP_RESULT_PATH,
+    };
+    use crate::adr_ramping::AdrLogMsg;
+    use std::fs::OpenOptions;
+    use std::io::Write as IoWrite;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    let _ = std::fs::create_dir_all("state");
+    set_adr_ramp_persisted(std::process::id());
+    let _ = std::fs::write(ADR_RAMP_LOG_PATH, "");
+    let _ = std::fs::write(ADR_RAMP_STATUS_PATH, "");
+    let _ = std::fs::remove_file(ADR_RAMP_STOP_PATH);
+    let _ = std::fs::remove_file(ADR_RAMP_RESULT_PATH);
+
+    // Thread that polls for a stop-request file and sets the stop flag.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop_flag);
+    std::thread::spawn(move || {
+        loop {
+            if std::path::Path::new(ADR_RAMP_STOP_PATH).exists() {
+                stop_clone.store(true, Ordering::SeqCst);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
+
+    // Thread that writes AdrLogMsg events to the state files the worker polls.
+    let (log_tx, log_rx) = mpsc::channel::<AdrLogMsg>();
+    std::thread::spawn(move || {
+        while let Ok(msg) = log_rx.recv() {
+            match msg {
+                AdrLogMsg::Line(line) => {
+                    if let Ok(mut f) = OpenOptions::new()
+                        .create(true).append(true).open(ADR_RAMP_LOG_PATH)
+                    {
+                        let _ = writeln!(f, "{line}");
+                    }
+                }
+                AdrLogMsg::Status(status) => {
+                    let _ = std::fs::write(ADR_RAMP_STATUS_PATH, &status);
+                }
+            }
+        }
+        let _ = std::fs::write(ADR_RAMP_STATUS_PATH, "");
+    });
+
+    let result = crate::adr_ramping::run_adr_ramp(rate, current, soak_mins, Some(&log_tx), Some(stop_flag));
+
+    // Write result before clearing the PID file so the worker can read it on exit.
+    match &result {
+        Ok(())  => { let _ = std::fs::write(ADR_RAMP_RESULT_PATH, "ok"); }
+        Err(e)  => { let _ = std::fs::write(ADR_RAMP_RESULT_PATH, format!("error:{e}")); }
+    }
+    drop(log_tx); // flush the log writer thread
+
+    clear_adr_ramp_persisted();
+    let _ = std::fs::remove_file(ADR_RAMP_STOP_PATH);
+
+    result
+}
+
 // ── Entry point ───────────────────────────────────────────────
 pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
@@ -549,7 +623,7 @@ pub fn run() -> Result<(), String> {
         },
         Device::Adr { command } => match command {
             AdrCmd::Ramp { rate, current, soak_mins } => {
-                crate::adr_ramping::run_adr_ramp(rate, current, soak_mins, None)
+                adr_ramp_subprocess(rate, current, soak_mins)
             }
             AdrCmd::Logging => {
                 let ctrl = LakeShore625Controller::default();
@@ -982,11 +1056,10 @@ fn run_record_temps(cmd: RecordTempsCmd) -> Result<(), String> {
 
     match cmd {
         RecordTempsCmd::Snapshot => {
-            let msg = crate::record_temps::record_single_snapshot(
+            let (record, msg) = crate::record_temps::record_single_snapshot(
                 &mut ls350, &mut ls370, OUTPUT_DIR,
             )?;
             println!("{}", msg);
-            let record = crate::record_temps::take_snapshot(&mut ls350, &mut ls370);
             let display = record.to_display();
             print!("{}", display);
             if !display.ends_with('\n') { println!(); }

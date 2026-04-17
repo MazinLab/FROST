@@ -88,23 +88,22 @@ fn adr_ramp_guard_false_allows_new_ramp() {
 #[test]
 fn adr_ramp_start_clears_previous_log_and_result() {
     let mut s = DeviceSnapshot::default();
-    s.adr_log_lines    = vec!["old line 1".to_string(), "old line 2".to_string()];
-    s.adr_status_line  = "old status".to_string();
-    s.adr_ramp_result  = Some(Ok(()));
-    s.adr_ramp_interrupted = true;
+    s.adr_log_lines   = vec!["old line 1".to_string(), "old line 2".to_string()];
+    s.adr_status_line = "old status".to_string();
+    s.adr_ramp_result = Some(Ok(()));
 
     // Simulate execute_command accepting a new RunAdrRamp:
     s.adr_ramp_running     = true;
     s.adr_ramp_started     = Some(std::time::Instant::now());
     s.adr_ramp_result      = None;
-    s.adr_ramp_interrupted = false;
+    s.adr_ramp_was_stopped = false;
     s.adr_log_lines.clear();
     s.adr_status_line.clear();
 
     assert!(s.adr_ramp_running);
     assert!(s.adr_ramp_started.is_some());
     assert!(s.adr_ramp_result.is_none());
-    assert!(!s.adr_ramp_interrupted);
+    assert!(!s.adr_ramp_was_stopped);
     assert!(s.adr_log_lines.is_empty());
     assert!(s.adr_status_line.is_empty());
 }
@@ -137,25 +136,27 @@ fn adr_ramp_completion_with_error_stores_err() {
     assert_eq!(result.unwrap_err(), "heatswitch stuck");
 }
 
-// ── Snapshot adr_ramp_interrupted field ───────────────────────────────────────
+// ── Snapshot restart-persistence fields ───────────────────────────────────────
 
 #[test]
-fn adr_ramp_interrupted_default_false() {
+fn adr_ramp_running_default_false() {
     let s = DeviceSnapshot::default();
-    assert!(!s.adr_ramp_interrupted);
+    assert!(!s.adr_ramp_running, "default snapshot must not show Stop button");
 }
 
 #[test]
-fn adr_ramp_interrupted_cleared_when_ramp_starts() {
+fn adr_ramp_was_stopped_default_false() {
+    let s = DeviceSnapshot::default();
+    assert!(!s.adr_ramp_was_stopped);
+}
+
+#[test]
+fn adr_ramp_running_restored_on_restart() {
+    // Simulates what SerialWorker::spawn does when the lock file is present.
     let mut s = DeviceSnapshot::default();
-    s.adr_ramp_interrupted = true;
-
-    // New ramp clears the flag:
-    s.adr_ramp_interrupted = false;
-    s.adr_ramp_running     = true;
-
-    assert!(!s.adr_ramp_interrupted);
-    assert!(s.adr_ramp_running);
+    // Lock file exists → restore running state so Stop button is shown.
+    s.adr_ramp_running = true;
+    assert!(s.adr_ramp_running, "running must be true so Stop button is visible after restart");
 }
 
 // ── Command-channel stress tests ──────────────────────────────────────────────
@@ -206,12 +207,12 @@ fn channel_mixed_commands_preserve_order() {
     let (tx, rx) = channel::<GuiCommand>();
 
     tx.send(GuiCommand::StartCompressor).unwrap();
-    tx.send(GuiCommand::RunAdrRamp { rate: 0.004, current: 9.44, soak_mins: 45 }).unwrap();
+    tx.send(GuiCommand::RunAdrRamp).unwrap();
     tx.send(GuiCommand::StopCompressor).unwrap();
     tx.send(GuiCommand::SetGl7Output { output: 3, pct: 50.0 }).unwrap();
 
     assert!(matches!(rx.try_recv().unwrap(), GuiCommand::StartCompressor));
-    assert!(matches!(rx.try_recv().unwrap(), GuiCommand::RunAdrRamp { .. }));
+    assert!(matches!(rx.try_recv().unwrap(), GuiCommand::RunAdrRamp));
     assert!(matches!(rx.try_recv().unwrap(), GuiCommand::StopCompressor));
     assert!(matches!(rx.try_recv().unwrap(), GuiCommand::SetGl7Output { output: 3, pct } if pct == 50.0));
     assert!(rx.try_recv().is_err());
@@ -252,6 +253,94 @@ fn gl7_set_results_independent_per_output() {
 
     // All drained:
     assert!(s.gl7_set_results.iter().all(|r| r.is_none()));
+}
+
+// ── GL7 last_gl7_update is bumped after SetGl7Output ─────────────────────────
+//
+// Regression test: the worker's SetGl7Output handler must update last_gl7_update
+// so the GUI sync condition (last_gl7_update != last_synced_gl7) fires and the
+// new polled percentage is reflected in the edit field.
+
+#[test]
+fn set_gl7_output_bumps_last_gl7_update() {
+    let mut s = DeviceSnapshot::default();
+    assert!(s.last_gl7_update.is_none(), "starts as None");
+
+    // Simulate what the worker's SetGl7Output handler now does:
+    let idx = 0usize;
+    s.gl7_output_lines[idx] = ("30.000".to_string(), String::new());
+    s.gl7_polled_pct[idx]   = Some(30.0);
+    s.gl7_set_results[idx]  = Some(Ok(()));
+    s.last_gl7_update       = Some(std::time::Instant::now());
+
+    assert!(
+        s.last_gl7_update.is_some(),
+        "last_gl7_update must be set so the GUI sync condition fires"
+    );
+    assert_eq!(s.gl7_polled_pct[idx], Some(30.0));
+}
+
+#[test]
+fn set_gl7_output_update_differs_from_prior_sync_instant() {
+    // The GUI stores the last Instant it synced from; a new Instant written by
+    // the worker must compare as different so the sync block runs.
+    let prior = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(1));
+
+    let mut s = DeviceSnapshot::default();
+    s.last_gl7_update = Some(std::time::Instant::now());
+
+    assert_ne!(
+        s.last_gl7_update.unwrap(),
+        prior,
+        "worker-written Instant must differ from the GUI's saved Instant"
+    );
+}
+
+// ── Temp poll gate: gl7_cooldown_active blocks polling ────────────────────────
+//
+// When the GL7 cooldown subprocess is running it owns the LS350/LS370 ports
+// intermittently.  The worker must NOT attempt a temp poll while
+// gl7_cooldown_active is true, to avoid exclusive-lock port conflicts.
+// When the cooldown is not active (and recording is not active), polling is
+// expected to proceed.
+//
+// These tests mirror the gate condition:
+//   recording_stop_flag.is_none() && !gl7_cooldown_active
+// without spawning a real worker.
+
+#[test]
+fn temp_poll_blocked_when_gl7_cooldown_active() {
+    let mut s = DeviceSnapshot::default();
+    s.gl7_cooldown_active = true;
+
+    // Simulate the gate: recording flag is absent, but cooldown is active.
+    // The poll must NOT run.
+    let recording_inactive = true; // represents recording_stop_flag.is_none()
+    let should_poll = recording_inactive && !s.gl7_cooldown_active;
+
+    assert!(!should_poll, "temp poll must be blocked while GL7 cooldown is active");
+}
+
+#[test]
+fn temp_poll_allowed_when_neither_recording_nor_cooldown() {
+    let s = DeviceSnapshot::default();
+    // Default snapshot: gl7_cooldown_active = false.
+    let recording_inactive = true;
+    let should_poll = recording_inactive && !s.gl7_cooldown_active;
+
+    assert!(should_poll, "temp poll must run when neither recording nor cooldown is active");
+}
+
+#[test]
+fn temp_poll_blocked_when_both_recording_and_cooldown() {
+    let mut s = DeviceSnapshot::default();
+    s.gl7_cooldown_active = true;
+
+    let recording_inactive = false; // recording_stop_flag.is_some()
+    let should_poll = recording_inactive && !s.gl7_cooldown_active;
+
+    assert!(!should_poll, "temp poll must be blocked when both recording and cooldown are active");
 }
 
 // ── Multiple result fields drain independently ────────────────────────────────

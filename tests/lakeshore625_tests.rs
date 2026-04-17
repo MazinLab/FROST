@@ -22,9 +22,9 @@ use std::fs;
 use frost::lakeshore625::{
     LakeShore625Controller,
     CURRENT_LIMIT_MAX, VOLTAGE_LIMIT_MIN, VOLTAGE_LIMIT_MAX, RATE_LIMIT_MIN, RATE_LIMIT_MAX,
+    ADR_CURRENT_MAX, ADR_COMPLIANCE_MAX, ADR_RATE_MAX,
     parse_error_status, parse_error_compact,
-    fmt_ramp_f64_opt, ramp_format_row, next_ramp_csv,
-    RAMP_WIDTHS,
+    fmt_ramp_f64_opt, next_ramp_log,
 };
 use frost::adr_ramping::{SOAK_TOLERANCE, ZERO_TOLERANCE};
 
@@ -69,20 +69,30 @@ fn compliance_voltage_at_min_passes_validation() {
 }
 
 #[test]
-fn compliance_voltage_at_max_passes_validation() {
-    // 5.0 V is exactly VOLTAGE_LIMIT_MAX — must be accepted.
+fn compliance_voltage_at_adr_max_passes_validation() {
+    // 1.5 V is exactly ADR_COMPLIANCE_MAX — must be accepted.
     let mut ctrl = test_controller();
-    let err = ctrl.set_compliance_voltage(VOLTAGE_LIMIT_MAX).unwrap_err();
+    let err = ctrl.set_compliance_voltage(ADR_COMPLIANCE_MAX).unwrap_err();
     assert!(err.starts_with("Failed to open"), "Got: {err}");
 }
 
 #[test]
-fn compliance_voltage_above_max_rejected() {
+fn compliance_voltage_above_adr_max_rejected() {
     let mut ctrl = test_controller();
-    let result = ctrl.set_compliance_voltage(5.001);
+    let result = ctrl.set_compliance_voltage(1.501);
     assert!(result.is_err());
     let msg = result.unwrap_err();
-    assert!(msg.contains("5.001"), "Error should mention the bad value. Got: {msg}");
+    assert!(msg.contains("1.501"), "Error should mention the bad value. Got: {msg}");
+    assert!(!msg.starts_with("Failed to open"), "Should fail at validation, not serial. Got: {msg}");
+}
+
+#[test]
+fn compliance_voltage_hardware_max_rejected() {
+    // 5.0 V is within hardware range but above ADR_COMPLIANCE_MAX — must be rejected.
+    let mut ctrl = test_controller();
+    let result = ctrl.set_compliance_voltage(VOLTAGE_LIMIT_MAX);
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
     assert!(!msg.starts_with("Failed to open"), "Should fail at validation, not serial. Got: {msg}");
 }
 
@@ -182,51 +192,76 @@ fn limits_rate_above_max_rejected() {
     assert!(!result.unwrap_err().starts_with("Failed to open"));
 }
 
-// ── Unvalidated commands (document the gap) ───────────────────────────────────
-//
-// set_current and set_ramp_rate have NO range validation — out-of-range values
-// are forwarded to the wire without being checked.  These tests pin that behavior:
-// the only error is a serial error, not a bounds check.  If validation is added
-// later, these tests should be updated to assert Err at the validation layer.
+// ── set_current validation ────────────────────────────────────────────────────
 
 #[test]
-fn set_current_negative_not_validated_reaches_serial() {
+fn set_current_zero_passes_validation() {
+    // 0 A is valid — used when de-magnetising at the end of a ramp.
     let mut ctrl = test_controller();
-    let err = ctrl.set_current(-1.0).unwrap_err();
-    assert!(
-        err.starts_with("Failed to open"),
-        "set_current has no validation — expected serial error. Got: {err}"
-    );
+    let err = ctrl.set_current(0.0).unwrap_err();
+    assert!(err.starts_with("Failed to open"), "Got: {err}");
 }
 
 #[test]
-fn set_current_above_hardware_max_not_validated_reaches_serial() {
+fn set_current_at_adr_max_passes_validation() {
+    // 9.45 A is exactly ADR_CURRENT_MAX — must be accepted.
     let mut ctrl = test_controller();
-    let err = ctrl.set_current(CURRENT_LIMIT_MAX + 1.0).unwrap_err();
-    assert!(
-        err.starts_with("Failed to open"),
-        "set_current has no validation — expected serial error. Got: {err}"
-    );
+    let err = ctrl.set_current(ADR_CURRENT_MAX).unwrap_err();
+    assert!(err.starts_with("Failed to open"), "Got: {err}");
 }
 
 #[test]
-fn set_ramp_rate_zero_not_validated_reaches_serial() {
+fn set_current_above_adr_max_rejected() {
     let mut ctrl = test_controller();
-    let err = ctrl.set_ramp_rate(0.0).unwrap_err();
-    assert!(
-        err.starts_with("Failed to open"),
-        "set_ramp_rate has no validation — expected serial error. Got: {err}"
-    );
+    let result = ctrl.set_current(9.46);
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(msg.contains("9.46"), "Error should mention the bad value. Got: {msg}");
+    assert!(!msg.starts_with("Failed to open"), "Should fail at validation, not serial. Got: {msg}");
 }
 
 #[test]
-fn set_ramp_rate_above_max_not_validated_reaches_serial() {
+fn set_current_negative_rejected() {
     let mut ctrl = test_controller();
-    let err = ctrl.set_ramp_rate(RATE_LIMIT_MAX + 1.0).unwrap_err();
-    assert!(
-        err.starts_with("Failed to open"),
-        "set_ramp_rate has no validation — expected serial error. Got: {err}"
-    );
+    let result = ctrl.set_current(-1.0);
+    assert!(result.is_err());
+    assert!(!result.unwrap_err().starts_with("Failed to open"));
+}
+
+// ── set_ramp_rate validation ──────────────────────────────────────────────────
+
+#[test]
+fn set_ramp_rate_at_adr_max_passes_validation() {
+    // 0.0055 A/s is exactly ADR_RATE_MAX — must be accepted.
+    let mut ctrl = test_controller();
+    let err = ctrl.set_ramp_rate(ADR_RATE_MAX).unwrap_err();
+    assert!(err.starts_with("Failed to open"), "Got: {err}");
+}
+
+#[test]
+fn set_ramp_rate_at_min_passes_validation() {
+    // RATE_LIMIT_MIN is the lower bound — must be accepted.
+    let mut ctrl = test_controller();
+    let err = ctrl.set_ramp_rate(RATE_LIMIT_MIN).unwrap_err();
+    assert!(err.starts_with("Failed to open"), "Got: {err}");
+}
+
+#[test]
+fn set_ramp_rate_above_adr_max_rejected() {
+    let mut ctrl = test_controller();
+    let result = ctrl.set_ramp_rate(0.006);
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(msg.contains("0.006"), "Error should mention the bad value. Got: {msg}");
+    assert!(!msg.starts_with("Failed to open"), "Should fail at validation, not serial. Got: {msg}");
+}
+
+#[test]
+fn set_ramp_rate_zero_rejected() {
+    let mut ctrl = test_controller();
+    let result = ctrl.set_ramp_rate(0.0);
+    assert!(result.is_err());
+    assert!(!result.unwrap_err().starts_with("Failed to open"));
 }
 
 // ── parse_error_status ────────────────────────────────────────────────────────
@@ -403,91 +438,48 @@ fn fmt_ramp_none_returns_no_response() {
     assert_eq!(fmt_ramp_f64_opt(None, 4), "NO_RESPONSE");
 }
 
-// ── ramp_format_row ───────────────────────────────────────────────────────────
-
-#[test]
-fn ramp_format_row_last_column_not_padded() {
-    // Build a full 9-column row where the last value is shorter than its slot.
-    // Every column except the last should be padded to its RAMP_WIDTHS entry;
-    // the last must appear verbatim at the end of the string.
-    let mut values: Vec<String> = RAMP_WIDTHS.iter()
-        .map(|w| "X".repeat(w - 1))
-        .collect();
-    *values.last_mut().unwrap() = "LAST".to_string();
-
-    let row = ramp_format_row(&values);
-    assert!(
-        row.ends_with("LAST"),
-        "Last column must not be padded. Row ends with: {:?}",
-        &row[row.len().saturating_sub(12)..]
-    );
-}
-
-#[test]
-fn ramp_format_row_non_last_columns_are_padded() {
-    // A two-element row: the first should be padded to RAMP_WIDTHS[0] (28 chars),
-    // the second (last) must not be padded.
-    let values = vec!["A".to_string(), "B".to_string()];
-    let row = ramp_format_row(&values);
-    assert_eq!(&row[..RAMP_WIDTHS[0]], format!("{:<28}", "A"));
-    assert!(row.ends_with('B'), "Last column should not be padded. Got: {row:?}");
-}
-
-#[test]
-fn ramp_format_row_single_element_not_padded() {
-    // With one element it is both first and last — no padding applied.
-    let row = ramp_format_row(&["only".to_string()]);
-    assert_eq!(row, "only");
-}
-
-#[test]
-fn ramp_format_row_empty_does_not_panic() {
-    let row = ramp_format_row(&[]);
-    assert_eq!(row, "");
-}
-
-// ── next_ramp_csv path generation ────────────────────────────────────────────
+// ── next_ramp_log path generation ────────────────────────────────────────────
 //
-// Uses uniquely-named temp directories to avoid interfering with any real ramp/
+// Uses uniquely-named temp directories to avoid interfering with any real ramp
 // logs and to make tests independent of each other.
 
 #[test]
-fn next_ramp_csv_no_file_returns_base_path() {
+fn next_ramp_log_no_file_returns_base_path() {
     let dir = std::env::temp_dir().join("frost_test_ramp_nofile");
     fs::create_dir_all(&dir).unwrap();
     let dir_s = dir.to_str().unwrap();
 
-    let path = next_ramp_csv(dir_s, "2099-01-01");
-    assert_eq!(path, format!("{}/2099-01-01_ramp_log.csv", dir_s));
+    let path = next_ramp_log(dir_s, "2099-01-01");
+    assert_eq!(path, format!("{}/2099-01-01_ramp_log.md", dir_s));
 
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn next_ramp_csv_base_exists_returns_suffix_1() {
+fn next_ramp_log_base_exists_returns_suffix_1() {
     let dir = std::env::temp_dir().join("frost_test_ramp_base");
     fs::create_dir_all(&dir).unwrap();
     let dir_s = dir.to_str().unwrap();
 
-    fs::write(format!("{}/2099-01-02_ramp_log.csv", dir_s), "").unwrap();
+    fs::write(format!("{}/2099-01-02_ramp_log.md", dir_s), "").unwrap();
 
-    let path = next_ramp_csv(dir_s, "2099-01-02");
-    assert_eq!(path, format!("{}/2099-01-02_ramp_log_1.csv", dir_s));
+    let path = next_ramp_log(dir_s, "2099-01-02");
+    assert_eq!(path, format!("{}/2099-01-02_ramp_log_1.md", dir_s));
 
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn next_ramp_csv_base_and_1_exist_returns_suffix_2() {
+fn next_ramp_log_base_and_1_exist_returns_suffix_2() {
     let dir = std::env::temp_dir().join("frost_test_ramp_1exists");
     fs::create_dir_all(&dir).unwrap();
     let dir_s = dir.to_str().unwrap();
 
-    fs::write(format!("{}/2099-01-03_ramp_log.csv",   dir_s), "").unwrap();
-    fs::write(format!("{}/2099-01-03_ramp_log_1.csv", dir_s), "").unwrap();
+    fs::write(format!("{}/2099-01-03_ramp_log.md",   dir_s), "").unwrap();
+    fs::write(format!("{}/2099-01-03_ramp_log_1.md", dir_s), "").unwrap();
 
-    let path = next_ramp_csv(dir_s, "2099-01-03");
-    assert_eq!(path, format!("{}/2099-01-03_ramp_log_2.csv", dir_s));
+    let path = next_ramp_log(dir_s, "2099-01-03");
+    assert_eq!(path, format!("{}/2099-01-03_ramp_log_2.md", dir_s));
 
     fs::remove_dir_all(&dir).ok();
 }

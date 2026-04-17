@@ -2,7 +2,6 @@
 
 use eframe::egui;
 use crate::worker::{DeviceSnapshot, GuiCommand, SerialWorker};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::{Duration, Instant};
 
 /// Launch the graphical user interface.
@@ -57,35 +56,25 @@ struct FrostApp {
     gl7_cooldown_csv_path: String,
     gl7_cooldown_result:   Option<Result<String, String>>,
     gl7_cooldown_child:    Option<std::process::Child>,
+    /// PID read from lock file on startup — used to kill the subprocess after a GUI reload.
+    gl7_cooldown_pid:      Option<u32>,
 
     // ── Temperature recording ─────────────────────────────────
-    record_result:        Option<Result<String, String>>,
-    recording_stop_flag:  Option<Arc<AtomicBool>>,
-    recording_csv_path:   Option<String>,
+    record_result: Option<Result<String, String>>,
 
     // ── ADR ramp ──────────────────────────────────────────────
     adr_ramp_rate:      f64,
     adr_ramp_current:   f64,
     adr_ramp_soak_mins: u64,
     adr_ramp_result:    Option<Result<(), String>>,
+    /// Child handle when the subprocess was spawned in this GUI session.
+    adr_ramp_child:     Option<std::process::Child>,
+    /// PID from lock file — used to kill the subprocess after a GUI reload.
+    adr_ramp_pid:       Option<u32>,
 }
 
 impl FrostApp {
     fn new(worker: SerialWorker) -> Self {
-        let (recording_stop_flag, recording_csv_path, record_result) =
-            if crate::record_temps::is_recording_active() {
-                match crate::record_temps::start_recording_loop(30, "temps") {
-                    Ok((path, flag)) => (
-                        Some(flag),
-                        Some(path.clone()),
-                        Some(Ok(format!("Resumed recording → {path}"))),
-                    ),
-                    Err(e) => (None, None, Some(Err(e))),
-                }
-            } else {
-                (None, None, None)
-            };
-
         Self {
             worker,
             magnet_target_current:          9.44,
@@ -103,16 +92,17 @@ impl FrostApp {
             magnet_rate_set_msg:       None,
             magnet_compliance_set_msg: None,
             gl7_set_msg: vec![None, None, None, None],
-            gl7_cooldown_csv_path: recording_csv_path.as_deref().unwrap_or("").to_string(),
+            gl7_cooldown_csv_path: String::new(),
             gl7_cooldown_result:   None,
             gl7_cooldown_child:    None,
-            record_result,
-            recording_stop_flag,
-            recording_csv_path,
+            gl7_cooldown_pid:      crate::worker::get_gl7_cooldown_pid(),
+            record_result:    None,
             adr_ramp_rate:      0.004,
             adr_ramp_current:   9.44,
             adr_ramp_soak_mins: 45,
             adr_ramp_result:    None,
+            adr_ramp_child:     None,
+            adr_ramp_pid:       crate::worker::get_adr_ramp_pid(),
         }
     }
 
@@ -163,6 +153,9 @@ impl eframe::App for FrostApp {
                 if let Some(r) = s.gl7_set_results[i].take()   { self.gl7_set_msg[i]            = Some(r); }
             }
             if let Some(r) = s.adr_ramp_result.take() { self.adr_ramp_result = Some(r); }
+            if let Some(r) = s.recording_start_result.take() {
+                self.record_result = Some(r);
+            }
 
             s.clone()
         };
@@ -241,10 +234,7 @@ impl eframe::App for FrostApp {
 
 impl FrostApp {
     fn show_status_bar(&self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
-        let is_recording = self.recording_stop_flag
-            .as_ref()
-            .map(|f| !f.load(Ordering::Relaxed))
-            .unwrap_or(false);
+        let is_recording = snap.recording_active;
 
         let outputs_on = snap.gl7_polled_pct.iter()
             .any(|p| p.map(|v| v > 0.0).unwrap_or(false));
@@ -253,7 +243,7 @@ impl FrostApp {
             .and_then(|s| s.parse::<f64>().ok())
             .map(|k| k > 0.0 && k < 0.4)
             .unwrap_or(false);
-        let gl7_active = outputs_on || head3_cold;
+        let gl7_active = outputs_on || head3_cold || snap.gl7_cooldown_active;
 
         let chips: &[(&str, bool)] = &[
             ("Compressor", snap.compressor_running),
@@ -396,7 +386,7 @@ impl FrostApp {
         }
     }
 
-    fn show_magnet_section(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot, ctx: &egui::Context) {
+    fn show_magnet_section(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot, _ctx: &egui::Context) {
         ui.add(
             egui::Label::new(
                 egui::RichText::new("ADR Cooldown")
@@ -408,24 +398,46 @@ impl FrostApp {
         );
         ui.add_space(6.0);
 
-        // ── Start button / running indicator ─────────────────────
+        // ── Detect natural subprocess exit ────────────────────────
+        let mut just_exited = false;
+        if let Some(ref mut child) = self.adr_ramp_child {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => { just_exited = true; }
+                Ok(None) => {}
+            }
+        }
+        if just_exited {
+            self.adr_ramp_child = None;
+            self.adr_ramp_pid   = None;
+        }
+        // Keep adr_ramp_pid fresh when running from a previous session.
+        if snap.adr_ramp_running && self.adr_ramp_child.is_none() && self.adr_ramp_pid.is_none() {
+            self.adr_ramp_pid = crate::worker::get_adr_ramp_pid();
+        }
+
+        // ── Start / Stop button ───────────────────────────────────
         ui.horizontal(|ui| {
             if snap.adr_ramp_running {
-                let elapsed = snap.adr_ramp_started
-                    .map(|t| t.elapsed().as_secs())
-                    .unwrap_or(0);
-                let mins = elapsed / 60;
-                let secs = elapsed % 60;
                 let btn = egui::Button::new(
-                    egui::RichText::new(
-                        format!("⏺  ADR Ramping  —  {mins}m {secs:02}s elapsed")
-                    )
-                    .strong()
-                    .size(18.0)
-                    .color(egui::Color32::WHITE),
+                    egui::RichText::new("⏹  Stop ADR Cooldown (Ramp Down)")
+                        .strong()
+                        .size(18.0)
+                        .color(egui::Color32::WHITE),
                 )
                 .fill(egui::Color32::from_rgb(185, 30, 30));
-                ui.add_enabled(false, btn);
+                if ui.add(btn).clicked() {
+                    // Kill the subprocess — by handle if available, else by stored PID.
+                    if let Some(mut child) = self.adr_ramp_child.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    } else if let Some(pid) = self.adr_ramp_pid.take() {
+                        let _ = std::process::Command::new("kill")
+                            .args(["-9", &pid.to_string()])
+                            .status();
+                    }
+                    self.adr_ramp_result = None;
+                    self.worker.send(GuiCommand::StopAdrRamp);
+                }
             } else {
                 let btn = egui::Button::new(
                     egui::RichText::new("▶  Start ADR Cooldown")
@@ -435,25 +447,35 @@ impl FrostApp {
                 )
                 .fill(egui::Color32::from_rgb(140, 185, 255));
                 if ui.add(btn).clicked() {
-                    self.adr_ramp_result = None;
-                    self.worker.send(GuiCommand::RunAdrRamp {
-                        rate:      self.adr_ramp_rate,
-                        current:   self.adr_ramp_current,
-                        soak_mins: self.adr_ramp_soak_mins,
-                    });
+                    // Spawn frost adr ramp as a detached subprocess so it survives GUI restarts.
+                    match std::env::current_exe()
+                        .map_err(|e| e.to_string())
+                        .and_then(|exe| {
+                            std::process::Command::new(&exe)
+                                .args([
+                                    "adr", "ramp",
+                                    &self.adr_ramp_rate.to_string(),
+                                    &self.adr_ramp_current.to_string(),
+                                    "--soak-mins",
+                                    &self.adr_ramp_soak_mins.to_string(),
+                                ])
+                                .spawn()
+                                .map_err(|e| e.to_string())
+                        })
+                    {
+                        Ok(child) => {
+                            self.adr_ramp_pid   = Some(child.id());
+                            self.adr_ramp_child = Some(child);
+                            self.adr_ramp_result = None;
+                            self.worker.send(GuiCommand::RunAdrRamp);
+                        }
+                        Err(e) => {
+                            self.adr_ramp_result = Some(Err(format!("Failed to start ramp process: {e}")));
+                        }
+                    }
                 }
             }
         });
-
-        // ── Interrupted-ramp warning (set when lock file found on startup) ──
-        if snap.adr_ramp_interrupted {
-            ui.add_space(4.0);
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 120, 0),
-                "⚠  ADR ramp was running when the GUI was last closed — it did not complete.",
-            );
-            ui.add_space(4.0);
-        }
 
         // ── Result feedback ───────────────────────────────────────
         if let Some(ref res) = self.adr_ramp_result {
@@ -512,45 +534,6 @@ impl FrostApp {
                         });
                 }
             });
-        }
-
-        // ── Live ramp log ─────────────────────────────────────────
-        if !snap.adr_log_lines.is_empty() || snap.adr_ramp_running {
-            ui.add_space(6.0);
-            egui::Frame::none()
-                .fill(egui::Color32::from_gray(18))
-                .rounding(egui::Rounding::same(6.0))
-                .inner_margin(egui::Margin::same(8.0))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    egui::ScrollArea::vertical()
-                        .id_source("adr_log_scroll")
-                        .max_height(200.0)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for line in &snap.adr_log_lines {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(line)
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(egui::Color32::from_rgb(160, 210, 160)),
-                                ).selectable(false));
-                            }
-                            if !snap.adr_status_line.is_empty() {
-                                ui.add(egui::Label::new(
-                                    egui::RichText::new(&snap.adr_status_line)
-                                        .monospace()
-                                        .size(12.0)
-                                        .color(egui::Color32::YELLOW),
-                                ).selectable(false));
-                            }
-                        });
-                });
-        }
-
-        // Request repaint every second while running to keep the elapsed timer fresh.
-        if snap.adr_ramp_running {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
 
         ui.add_space(8.0);
@@ -711,26 +694,58 @@ impl FrostApp {
         );
         ui.add_space(6.0);
 
-        // Check whether the GL7 subprocess has finished.
+        // Check whether the GL7 subprocess has finished naturally.
+        let mut gl7_just_exited = false;
         if let Some(ref mut child) = self.gl7_cooldown_child {
             match child.try_wait() {
-                Ok(Some(_)) => { self.gl7_cooldown_child = None; }
-                Ok(None)    => {}  // still running
-                Err(_)      => { self.gl7_cooldown_child = None; }
+                Ok(Some(_)) | Err(_) => { gl7_just_exited = true; }
+                Ok(None)             => {}  // still running
             }
         }
-        let gl7_running = self.gl7_cooldown_child.is_some();
+        if gl7_just_exited {
+            self.gl7_cooldown_child = None;
+            self.gl7_cooldown_pid   = None;
+            crate::worker::clear_gl7_cooldown_persisted();
+            self.worker.send(GuiCommand::Gl7CooldownActive(false));
+        }
+
+        // Running if child is alive in this session OR lock file says so (after reload / CLI).
+        let gl7_running = self.gl7_cooldown_child.is_some() || snap.gl7_cooldown_active;
+
+        // When running externally (CLI or previous session), keep the stored PID
+        // fresh so the stop button can kill the right process.
+        if gl7_running && self.gl7_cooldown_child.is_none() && self.gl7_cooldown_pid.is_none() {
+            self.gl7_cooldown_pid = crate::worker::get_gl7_cooldown_pid();
+        }
 
         ui.horizontal(|ui| {
             if gl7_running {
                 let btn = egui::Button::new(
-                    egui::RichText::new("⏺  GL7 Cooldown In-Progress")
+                    egui::RichText::new("⏹  Stop GL7 Cooldown")
                         .strong()
                         .size(18.0)
                         .color(egui::Color32::WHITE),
                 )
                 .fill(egui::Color32::from_rgb(185, 30, 30));
-                ui.add_enabled(false, btn);
+                if ui.add(btn).clicked() {
+                    // Kill the subprocess — by handle if available, else by stored PID.
+                    if let Some(mut child) = self.gl7_cooldown_child.take() {
+                        let _ = child.kill();
+                        // Wait for the process to exit so the OS reclaims its
+                        // serial port file descriptor before we queue writes.
+                        let _ = child.wait();
+                    } else if let Some(pid) = self.gl7_cooldown_pid.take() {
+                        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+                    }
+                    crate::worker::clear_gl7_cooldown_persisted();
+                    // Zero all GL7 outputs.
+                    for output in 1u8..=4 {
+                        self.worker.send(GuiCommand::SetGl7Output { output, pct: 0.0 });
+                    }
+                    self.worker.send(GuiCommand::Gl7CooldownActive(false));
+                    self.gl7_cooldown_result =
+                        Some(Ok("GL7 cooldown stopped. All outputs set to 0%.".to_string()));
+                }
             } else {
                 let cooldown_btn = egui::Button::new(
                     egui::RichText::new("Start GL7 Cooldown")
@@ -751,7 +766,11 @@ impl FrostApp {
                             .spawn()
                         {
                             Ok(child) => {
+                                let pid = child.id();
+                                self.gl7_cooldown_pid   = Some(pid);
                                 self.gl7_cooldown_child = Some(child);
+                                crate::worker::set_gl7_cooldown_persisted(pid);
+                                self.worker.send(GuiCommand::Gl7CooldownActive(true));
                                 self.gl7_cooldown_result =
                                     Some(Ok(format!("GL7 cooldown started  (CSV: {path})")));
                             }
@@ -770,12 +789,18 @@ impl FrostApp {
                     .hint_text("path to temperature CSV…"),
             );
             if ui.button("Current Temperature Recording").clicked() {
-                if let Some(ref p) = self.recording_csv_path {
+                if let Some(ref p) = snap.recording_csv_path {
                     self.gl7_cooldown_csv_path = p.clone();
                 }
             }
         });
-        if let Some(ref res) = self.gl7_cooldown_result {
+        if gl7_running && self.gl7_cooldown_child.is_none() {
+            // Running externally (CLI or reloaded while cooldown was in progress).
+            ui.colored_label(
+                egui::Color32::DARK_GREEN,
+                "GL7 cooldown active (started from CLI or previous session).",
+            );
+        } else if let Some(ref res) = self.gl7_cooldown_result {
             match res {
                 Ok(msg) => { ui.colored_label(egui::Color32::DARK_GREEN, msg); }
                 Err(e)  => { ui.colored_label(egui::Color32::RED, e.as_str()); }
@@ -854,10 +879,7 @@ impl FrostApp {
     }
 
     fn show_temperature_display(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
-        let is_recording = self.recording_stop_flag
-            .as_ref()
-            .map(|f| !f.load(Ordering::Relaxed))
-            .unwrap_or(false);
+        let is_recording = snap.recording_active;
 
         ui.horizontal(|ui| {
             if is_recording {
@@ -869,15 +891,9 @@ impl FrostApp {
                 )
                 .fill(egui::Color32::from_rgb(185, 30, 30));
                 if ui.add(btn).clicked() {
-                    if let Some(flag) = &self.recording_stop_flag {
-                        flag.store(true, Ordering::Relaxed);
-                    }
-                    self.recording_stop_flag = None;
-                    crate::record_temps::clear_recording_active();
-                    self.record_result = Some(Ok(
-                        format!("Recording stopped. File: {}",
-                            self.recording_csv_path.as_deref().unwrap_or("unknown"))
-                    ));
+                    let path = snap.recording_csv_path.as_deref().unwrap_or("unknown").to_string();
+                    self.worker.send(GuiCommand::StopRecording);
+                    self.record_result = Some(Ok(format!("Recording stopped. File: {path}")));
                 }
             } else {
                 let btn = egui::Button::new(
@@ -888,16 +904,11 @@ impl FrostApp {
                 )
                 .fill(egui::Color32::from_rgb(140, 185, 255));
                 if ui.add(btn).clicked() {
-                    match crate::record_temps::start_recording_loop(30, "temps") {
-                        Ok((path, flag)) => {
-                            self.recording_csv_path = Some(path.clone());
-                            self.recording_stop_flag = Some(flag);
-                            self.record_result = Some(Ok(format!("Recording to: {path}")));
-                        }
-                        Err(e) => {
-                            self.record_result = Some(Err(e));
-                        }
-                    }
+                    self.worker.send(GuiCommand::StartRecording {
+                        interval_secs: 30,
+                        output_dir: "temps".to_string(),
+                        resume_path: None,
+                    });
                 }
             }
         });

@@ -42,6 +42,14 @@ impl HeatswitchController {
             .map_err(|e| format!("Failed to open {}: {e}", self.port))
     }
 
+    fn with_driver<F>(&mut self, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut crate::serial::ZaberDriver) -> Result<(), crate::serial::ZaberError>,
+    {
+        let mut drv = self.connect()?;
+        f(&mut drv).map_err(|e| e.to_string())
+    }
+
     // ── Status ───────────────────────────────────────────────
     pub fn get_status(&mut self) {
         match self.connect() {
@@ -157,61 +165,17 @@ impl HeatswitchController {
     }
 
     // ── Motion ───────────────────────────────────────────────
-    pub fn home(&mut self) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.home().map_err(|e| e.to_string())
-    }
-
-    pub fn move_absolute(&mut self, position: i32) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.move_absolute(position).map_err(|e| e.to_string())
-    }
-
-    pub fn move_relative(&mut self, steps: i32) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.move_relative(steps).map_err(|e| e.to_string())
-    }
-
-    pub fn rotate_cw(&mut self, steps: i32) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.move_relative(steps.abs()).map_err(|e| e.to_string())
-    }
-
-    pub fn rotate_ccw(&mut self, steps: i32) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.move_relative(-steps.abs()).map_err(|e| e.to_string())
-    }
-
-    pub fn move_velocity(&mut self, velocity: i32) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.move_velocity(velocity).map_err(|e| e.to_string())
-    }
-
-    pub fn stop(&mut self) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.stop().map_err(|e| e.to_string())
-    }
-
-    pub fn emergency_stop(&mut self) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.emergency_stop().map_err(|e| e.to_string())
-    }
-
-    pub fn reset(&mut self) -> Result<(), String> {
-        let mut drv = self.connect()?;
-        drv.home().map_err(|e| e.to_string())
-    }
+    pub fn home(&mut self)                          -> Result<(), String> { self.with_driver(|d| d.home()) }
+    pub fn move_absolute(&mut self, position: i32)  -> Result<(), String> { self.with_driver(|d| d.move_absolute(position)) }
+    pub fn move_relative(&mut self, steps: i32)     -> Result<(), String> { self.with_driver(|d| d.move_relative(steps)) }
+    pub fn rotate_cw(&mut self, steps: i32)         -> Result<(), String> { self.with_driver(|d| d.move_relative(steps.abs())) }
+    pub fn rotate_ccw(&mut self, steps: i32)        -> Result<(), String> { self.with_driver(|d| d.move_relative(-steps.abs())) }
+    pub fn move_velocity(&mut self, velocity: i32)  -> Result<(), String> { self.with_driver(|d| d.move_velocity(velocity)) }
+    pub fn stop(&mut self)                          -> Result<(), String> { self.with_driver(|d| d.stop()) }
+    pub fn emergency_stop(&mut self)                -> Result<(), String> { self.with_driver(|d| d.emergency_stop()) }
+    pub fn reset(&mut self)                         -> Result<(), String> { self.with_driver(|d| d.home()) }
 
     // ── Safe (limited) moves ─────────────────────────────────
-    pub fn safe_cw(&mut self, steps: i32) -> Result<(), String> {
-        let clamped = steps.clamp(1, 1000);
-        let mut drv = self.connect()?;
-        drv.move_relative(clamped).map_err(|e| e.to_string())
-    }
-
-    pub fn safe_ccw(&mut self, steps: i32) -> Result<(), String> {
-        let clamped = steps.clamp(1, 1000);
-        let mut drv = self.connect()?;
-        drv.move_relative(-clamped).map_err(|e| e.to_string())
-    }
+    pub fn safe_cw(&mut self, steps: i32)  -> Result<(), String> { self.with_driver(|d| d.move_relative(steps.clamp(1, 1000))) }
+    pub fn safe_ccw(&mut self, steps: i32) -> Result<(), String> { self.with_driver(|d| d.move_relative(-steps.clamp(1, 1000))) }
 }

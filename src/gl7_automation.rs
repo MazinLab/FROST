@@ -46,14 +46,17 @@ impl Gl7Logger {
             .map_err(|e| format!("Could not create {}: {e}", logs_dir.display()))?;
         let date = Local::now().format("%Y_%m_%d").to_string();
         let base = logs_dir.join(format!("{}_gl7_log", date));
-        let path = (1..)
+        let path = (1..=9999u32)
             .map(|i| if i == 1 {
                 format!("{}.md", base.display())
             } else {
                 format!("{}_{i}.md", base.display())
             })
             .find(|p| !std::path::Path::new(p).exists())
-            .unwrap();
+            .ok_or_else(|| format!(
+                "Could not find available log file under {}; too many logs for today",
+                logs_dir.display()
+            ))?;
         let file = fs::File::create(&path)
             .map_err(|e| format!("Could not create log file {path}: {e}"))?;
         println!("[GL7] Logging to {path}");
@@ -279,8 +282,10 @@ fn refresh_output(ls350: &mut LakeShore350Controller, output: u8, current: f64, 
 // ── LS350 output setter ───────────────────────────────────────────────────────
 
 /// Set one LS350 manual output percentage, retrying if the port is busy.
+/// On success, updates the shared state file so the GUI can display the new
+/// value without polling the LS350 port (which the subprocess owns exclusively).
 fn set_output_pct(ls350: &mut LakeShore350Controller, output: u8, pct: f64) -> Result<(), String> {
-    retry_on_busy(
+    let result = retry_on_busy(
         &format!("set output {}", output),
         Duration::from_secs(BUSY_RETRY_SECS),
         || {
@@ -290,7 +295,21 @@ fn set_output_pct(ls350: &mut LakeShore350Controller, output: u8, pct: f64) -> R
             }
             Ok(())
         },
-    )
+    );
+    if result.is_ok() {
+        update_output_state_file(output, pct);
+    }
+    result
+}
+
+/// Read-modify-write the GL7 outputs state file for one output channel.
+/// Reads the existing file (defaulting to 0.0 per output if absent or malformed),
+/// updates the relevant slot, and writes back.
+fn update_output_state_file(output: u8, pct: f64) {
+    if !(1..=4).contains(&output) { return; }
+    let mut vals = crate::worker::read_gl7_output_state().unwrap_or([0.0; 4]);
+    vals[(output as usize) - 1] = pct;
+    crate::worker::write_gl7_output_state(vals);
 }
 
 // ── Safety limit helpers ──────────────────────────────────────────────────────
@@ -1054,12 +1073,34 @@ pub fn phase2_stabilize(csv_path: &str, out1_init: f64, out2_init: f64, log: &mu
 
 // ── Full cooldown sequence (Phases 0 → 1 → 2 → 3) ───────────────────────────
 
+/// RAII guard: writes the GL7 cooldown lock file on construction and removes
+/// it on drop. Ensures the file is cleared even if a phase returns an error.
+struct Gl7CooldownLockGuard;
+
+impl Gl7CooldownLockGuard {
+    fn new() -> Self {
+        crate::worker::set_gl7_cooldown_persisted(std::process::id());
+        Self
+    }
+}
+
+impl Drop for Gl7CooldownLockGuard {
+    fn drop(&mut self) {
+        crate::worker::clear_gl7_cooldown_persisted();
+        crate::worker::clear_gl7_output_state();
+    }
+}
+
 /// Run the full GL7 cooldown sequence: phases 0 through 5.
 ///
 /// Each phase hands off its final output percentages to the next via return
 /// values. If any phase returns an error the sequence halts immediately and
 /// the error is propagated.
 pub fn run_cooldown(csv_path: &str) -> Result<(), String> {
+    // Write the lock file for the duration of this run so the GUI can detect
+    // CLI-started cooldowns and show the red Stop button.
+    let _lock = Gl7CooldownLockGuard::new();
+
     let mut log = Gl7Logger::new(csv_path)?;
     log.phase("[GL7] === Starting GL7 cooldown sequence ===");
     log.blank();

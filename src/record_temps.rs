@@ -55,8 +55,9 @@ const WIDTHS: &[usize] = &[28, 12, 12, 17, 16, 15, 17, 17, 20, 18, 20, 20, 16, 1
 const LOCK_PATH: &str = "temps/.recording_active";
 
 /// Create the lock file that signals recording is in progress.
-pub fn set_recording_active() {
-    let _ = fs::write(LOCK_PATH, "");
+/// Stores the CSV path so the GUI can resume appending to the same file after a restart.
+pub fn set_recording_active(csv_path: &str) {
+    let _ = fs::write(LOCK_PATH, csv_path);
 }
 
 /// Remove the lock file (recording has stopped).
@@ -67,6 +68,16 @@ pub fn clear_recording_active() {
 /// Returns true if the lock file exists (recording was active when last stopped).
 pub fn is_recording_active() -> bool {
     Path::new(LOCK_PATH).exists()
+}
+
+/// Returns the CSV path stored in the lock file, if any.
+/// Used by the GUI on startup to resume appending to the same file rather than
+/// creating a new one.
+pub fn get_recording_active_path() -> Option<String> {
+    fs::read_to_string(LOCK_PATH)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 // ── Data snapshot ──────────────────────────────────────────────
@@ -142,8 +153,7 @@ impl TemperatureRecord {
         fields.iter()
             .enumerate()
             .map(|(i, v)| pad(v, WIDTHS[i]))
-            .collect::<Vec<_>>()
-            .join("")
+            .collect::<String>()
             .trim_end()
             .to_string()
     }
@@ -153,15 +163,14 @@ impl TemperatureRecord {
         HEADERS.iter()
             .enumerate()
             .map(|(i, h)| pad(h, WIDTHS[i]))
-            .collect::<Vec<_>>()
-            .join("")
+            .collect::<String>()
             .trim_end()
             .to_string()
     }
 
     /// Separator line of dashes, matching header width.
     pub fn separator_line() -> String {
-        WIDTHS.iter().map(|&w| "-".repeat(w)).collect::<Vec<_>>().join("")
+        WIDTHS.iter().map(|&w| "-".repeat(w)).collect::<String>()
     }
 
     /// Human-readable single-line summary (for terminal loop output).
@@ -261,27 +270,36 @@ pub fn take_snapshot(
 
 // ── Public API ─────────────────────────────────────────────────
 
-/// Take one snapshot, append to today's CSV, return status string.
+/// Take one snapshot, append to today's CSV, return the record and a status string.
 pub fn record_single_snapshot(
     ls350: &mut LakeShore350Controller,
     ls370: &mut LakeShore370Controller,
     output_dir: &str,
-) -> Result<String, String> {
+) -> Result<(TemperatureRecord, String), String> {
     let record = take_snapshot(ls350, ls370);
     let path   = get_or_create_csv(output_dir)?;
     append_row(&path, &record.to_fixed_row())?;
-    Ok(format!("Saved to {}  ({})", path, record.timestamp))
+    let msg = format!("Saved to {}  ({})", path, record.timestamp);
+    Ok((record, msg))
 }
 
 /// Spawn a background recording thread, returning the CSV path and a stop flag
 /// immediately so the GUI can display the path and toggle the button.
 /// Call `stop_flag.store(true, Ordering::Relaxed)` to halt the thread.
+///
+/// If `resume_path` names an existing file, recording resumes by appending to
+/// that file (no new header is written).  Pass `None` to start a fresh file.
 pub fn start_recording_loop(
     interval_secs: u64,
     output_dir: &str,
+    resume_path: Option<String>,
+    on_snapshot: impl Fn(&TemperatureRecord) + Send + 'static,
 ) -> Result<(String, Arc<AtomicBool>), String> {
-    let path      = get_or_create_csv(output_dir)?;
-    set_recording_active();
+    let path = match resume_path {
+        Some(p) if Path::new(&p).exists() => p,
+        _ => get_or_create_csv(output_dir)?,
+    };
+    set_recording_active(&path);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
     let path_clone = path.clone();
@@ -293,6 +311,7 @@ pub fn start_recording_loop(
         while !stop_clone.load(Ordering::Relaxed) {
             let record = take_snapshot(&mut ls350, &mut ls370);
             let _ = append_row(&path_clone, &record.to_fixed_row());
+            on_snapshot(&record);
 
             // Sleep in 100 ms ticks so the stop flag is checked quickly
             for _ in 0..(interval_secs * 10) {

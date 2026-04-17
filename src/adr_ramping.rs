@@ -19,13 +19,16 @@
 //   8. Wait for current to reach ≤ 0.004 A
 //   9. Stop background logger
 
+use std::fs::{File, OpenOptions};
 use std::io::{Write, stdout};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+use chrono::Local;
+
 use crate::heatswitch::HeatswitchController;
-use crate::lakeshore625::LakeShore625Controller;
+use crate::lakeshore625::{LakeShore625Controller, ADR_CURRENT_MAX, ADR_RATE_MAX};
 
 // ── Ramp tolerances ───────────────────────────────────────────────────────────
 
@@ -63,27 +66,54 @@ pub fn run_adr_ramp(
     current: f64,
     soak_mins: u64,
     log: Option<&Sender<AdrLogMsg>>,
+    stop: Option<Arc<AtomicBool>>,
 ) -> Result<(), String> {
-    // Closures that print to stdout AND optionally send to the GUI channel.
+    // ── Parameter validation (before any hardware or thread interaction) ─────
+    if !(0.0..=ADR_CURRENT_MAX).contains(&current) {
+        return Err(format!("Current must be 0–{ADR_CURRENT_MAX} A, got {current}"));
+    }
+    if rate <= 0.0 || rate > ADR_RATE_MAX {
+        return Err(format!("Rate must be >0–{ADR_RATE_MAX} A/s, got {rate}"));
+    }
+
+    // ── Create the shared MD log file ────────────────────────────────────────
+    // Both the ADR narrative lines and the background LS625 readings go here.
+    let log_path = LakeShore625Controller::next_log_path();
+    std::fs::create_dir_all("ramps")
+        .map_err(|e| format!("Cannot create 'ramps' directory: {e}"))?;
+    let md_file: Arc<Mutex<File>> = {
+        let mut f = OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open(&log_path)
+            .map_err(|e| format!("Cannot create log '{}': {e}", log_path))?;
+        writeln!(f, "# ADR Ramp Log — {}\n", Local::now().format("%Y-%m-%d %H:%M:%S"))
+            .map_err(|e| format!("Write error: {e}"))?;
+        Arc::new(Mutex::new(f))
+    };
+
+    // Closures that print to stdout, relay to the GUI channel, and write to the MD file.
     // `log` is `Option<&Sender<...>>` which is Copy, so both closures can capture it.
     let ll = |msg: String| {                          // permanent log line
+        let ts = Local::now().format("%Y-%m-%d %H:%M:%S");
         println!("{}", msg);
-        if let Some(tx) = log { let _ = tx.send(AdrLogMsg::Line(msg)); }
+        if let Some(tx) = log { let _ = tx.send(AdrLogMsg::Line(msg.clone())); }
+        if let Ok(mut f) = md_file.lock() { writeln!(f, "[{}] {}", ts, msg).ok(); }
     };
     let ls = |msg: String| {                          // live status line (no newline)
         print!("\r{}", msg);
         stdout().flush().ok();
         if let Some(tx) = log { let _ = tx.send(AdrLogMsg::Status(msg)); }
     };
+
     // ── Start background ramp logger ──────────────────────────────────────────
-    let log_path   = LakeShore625Controller::next_log_path();
     ll(format!("[ADR] Ramp data logging → {}", log_path));
 
-    let stop_flag  = Arc::new(AtomicBool::new(false));
-    let stop_clone = Arc::clone(&stop_flag);
+    let stop_flag       = Arc::new(AtomicBool::new(false));
+    let stop_clone      = Arc::clone(&stop_flag);
+    let md_file_logger  = Arc::clone(&md_file);
     let log_thread = std::thread::spawn(move || {
         let ctrl = LakeShore625Controller::default();
-        if let Err(e) = ctrl.run_logging_until(stop_clone, false) {
+        if let Err(e) = ctrl.run_logging_until(stop_clone, Some(md_file_logger)) {
             eprintln!("[ADR] Logging error: {e}");
         }
     });
@@ -112,6 +142,11 @@ pub fn run_adr_ramp(
     let tolerance = SOAK_TOLERANCE;
 
     loop {
+        if stop.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+            stop_flag.store(true, Ordering::Relaxed);
+            let _ = log_thread.join();
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_secs(2)); // Check every 2 seconds
 
         match ls625.get_current() {
@@ -142,7 +177,11 @@ pub fn run_adr_ramp(
     ));
     ll(format!("[ADR]           → Soaking at {} A...", current));
     let soak_duration = Duration::from_secs(soak_mins * 60);
-    countdown(soak_duration, log);
+    if countdown(soak_duration, log, stop.as_ref()) {
+        stop_flag.store(true, Ordering::Relaxed);
+        let _ = log_thread.join();
+        return Ok(());
+    }
     ll("[ADR]           ✓ Soak complete.".to_string());
 
     // ── Step 4: Open heat switch ──────────────────────────────────────────────
@@ -151,6 +190,11 @@ pub fn run_adr_ramp(
 
     // 30-second countdown warning
     for i in (1..=30).rev() {
+        if stop.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+            stop_flag.store(true, Ordering::Relaxed);
+            let _ = log_thread.join();
+            return Ok(());
+        }
         ls(format!("[ADR]           Opening heat switch in {} seconds...  ", i));
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -169,7 +213,11 @@ pub fn run_adr_ramp(
     // ── Step 5: Wait for heat switch to fully open ────────────────────────────
     ll("[ADR] Step 5/7 — Waiting 3 minutes for heat switch to fully open...".to_string());
     let buffer_duration = Duration::from_secs(3 * 60); // 3 minutes
-    countdown(buffer_duration, log);
+    if countdown(buffer_duration, log, stop.as_ref()) {
+        stop_flag.store(true, Ordering::Relaxed);
+        let _ = log_thread.join();
+        return Ok(());
+    }
     ll("[ADR]           ✓ Heat switch buffer complete.".to_string());
 
     // ── Step 6: Ramp current to 0 ────────────────────────────────────────────
@@ -186,6 +234,11 @@ pub fn run_adr_ramp(
     let zero_tolerance = ZERO_TOLERANCE;
 
     loop {
+        if stop.as_ref().map_or(false, |f| f.load(Ordering::Relaxed)) {
+            stop_flag.store(true, Ordering::Relaxed);
+            let _ = log_thread.join();
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_secs(2)); // Check every 2 seconds
 
         match ls625.get_current() {
@@ -221,11 +274,17 @@ pub fn run_adr_ramp(
 /// Blocks for `duration`, printing a live countdown to stdout that updates every
 /// second by overwriting the current line with `\r`.  A final newline is printed
 /// once the soak is over.  Pass `Some(tx)` to also relay status to the GUI.
-fn countdown(duration: Duration, log: Option<&Sender<AdrLogMsg>>) {
+/// Returns `true` if interrupted by the stop flag before duration elapsed.
+fn countdown(duration: Duration, log: Option<&Sender<AdrLogMsg>>, stop: Option<&Arc<AtomicBool>>) -> bool {
     let start = Instant::now();
     let total_secs = duration.as_secs();
 
     loop {
+        if stop.map_or(false, |f| f.load(Ordering::Relaxed)) {
+            if let Some(tx) = log { let _ = tx.send(AdrLogMsg::Status(String::new())); }
+            return true;
+        }
+
         let elapsed = start.elapsed();
         if elapsed >= duration {
             break;
@@ -257,4 +316,5 @@ fn countdown(duration: Duration, log: Option<&Sender<AdrLogMsg>>) {
     stdout().flush().ok();
     println!();
     if let Some(tx) = log { let _ = tx.send(AdrLogMsg::Status(String::new())); }
+    false
 }

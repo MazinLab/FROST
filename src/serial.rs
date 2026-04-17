@@ -79,13 +79,22 @@ pub fn scpi_write(
 }
 
 fn open_scpi_port(port: &str, baud: u32) -> Result<Box<dyn SerialPort>, String> {
-    serialport::new(port, baud)
-        .data_bits(DataBits::Seven)
-        .parity(Parity::Odd)
-        .stop_bits(StopBits::One)
-        .timeout(Duration::from_millis(2000))
-        .open()
-        .map_err(|e| format!("Failed to open {port}: {e}"))
+    loop {
+        match serialport::new(port, baud)
+            .data_bits(DataBits::Seven)
+            .parity(Parity::Odd)
+            .stop_bits(StopBits::One)
+            .timeout(Duration::from_millis(2000))
+            .open()
+        {
+            Ok(handle) => return Ok(handle),
+            Err(e) if e.to_string().contains("Device or resource busy") => {
+                eprintln!("Port {port} busy, retrying in 15 s…");
+                std::thread::sleep(Duration::from_secs(15));
+            }
+            Err(e) => return Err(format!("Failed to open {port}: {e}")),
+        }
+    }
 }
 
 // ── Zaber binary protocol ─────────────────────────────────────
@@ -122,8 +131,6 @@ pub enum ZaberError {
 type ZResult<T> = std::result::Result<T, ZaberError>;
 
 /// Wire-format frame sent to a Zaber device (6 bytes, packed LE).
-/// Exposed as `pub` so frame-layout tests in `tests/serial_tests.rs` can verify
-/// the unsafe byte casting against the protocol spec.
 #[repr(C, packed)]
 pub struct ZaberCommand {
     pub device_id: u8,
@@ -139,6 +146,10 @@ pub struct ZaberResponse {
     pub data: u32,
 }
 
+// Compile-time guarantee: struct layout must stay 6 bytes to match the wire protocol.
+const _: () = assert!(std::mem::size_of::<ZaberCommand>()  == 6);
+const _: () = assert!(std::mem::size_of::<ZaberResponse>() == 6);
+
 pub struct ZaberDriver {
     port: Box<dyn SerialPort>,
     device_id: u8,
@@ -153,29 +164,22 @@ impl ZaberDriver {
     }
 
     fn send_command(&mut self, command: u8, data: u32) -> ZResult<ZaberResponse> {
-        let cmd = ZaberCommand {
-            device_id: self.device_id,
-            command,
-            data: data.to_le(),
-        };
-        let cmd_bytes = unsafe {
-            std::slice::from_raw_parts(
-                &cmd as *const ZaberCommand as *const u8,
-                std::mem::size_of::<ZaberCommand>(),
-            )
-        };
-        self.port.write_all(cmd_bytes)?;
+        // Serialise: device_id, command, data in little-endian — 6 bytes total.
+        let data_le = data.to_le_bytes();
+        let cmd_bytes: [u8; 6] = [
+            self.device_id, command,
+            data_le[0], data_le[1], data_le[2], data_le[3],
+        ];
+        self.port.write_all(&cmd_bytes)?;
 
-        let mut response_bytes = [0u8; 6];
-        self.port.read_exact(&mut response_bytes)?;
+        // Deserialise the 6-byte response frame.
+        let mut buf = [0u8; 6];
+        self.port.read_exact(&mut buf)?;
 
-        let response = unsafe {
-            std::ptr::read(response_bytes.as_ptr() as *const ZaberResponse)
-        };
         Ok(ZaberResponse {
-            device_id: response.device_id,
-            command: response.command,
-            data: u32::from_le(response.data),
+            device_id: buf[0],
+            command:   buf[1],
+            data: u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
         })
     }
 
