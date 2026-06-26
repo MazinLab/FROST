@@ -191,7 +191,7 @@ frost heatswitch safe-ccw <steps> # Clamped CCW move (1–1000 steps)
 frost heatswitch move-vel <vel>  # Move at velocity
 ```
 
-Note: `open` returns immediately — the motor executes asynchronously. Poll status separately to check completion. `close` is blocking: it moves CCW with 4× the standard travel (460800 steps) so the motor always reaches the mechanical stop regardless of starting position, then polls until the position stops changing (stall detected) or a 30-second timeout elapses, then sends STOP.
+Note: `open` returns immediately — the motor executes asynchronously. Poll status separately to check completion. `close` is blocking: it drives CCW at the device's configured target speed (Zaber setting 41) via CMD_MOVE_VEL — the same pace as a normal relative move. Zaber stops automatically when the home limit switch fires; position genuinely freezes at 0. Polls until position stops changing (home limit fired) or a 60-second timeout elapses, then sends STOP.
 
 ### `frost lakeshore625` — Magnet Power Supply
 

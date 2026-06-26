@@ -38,10 +38,9 @@ fn open_fails_on_bad_port() {
 
 // ── Hardware tests (require physical Zaber T-NM17A04 on /dev/ttyUSB4) ────────
 
-/// Verify that close() drives the motor until stall and returns Ok.
+/// Verify that close() sends the CCW move command and returns Ok immediately.
 ///
-/// Requires: Zaber T-NM17A04 connected to /dev/ttyUSB4, heat switch mechanism
-/// free to move and able to reach its mechanical close stop within 30 seconds.
+/// Requires: Zaber T-NM17A04 connected to /dev/ttyUSB4.
 #[test]
 #[ignore = "requires Zaber T-NM17A04 on /dev/ttyUSB4"]
 fn close_until_resistance_real_hardware() {

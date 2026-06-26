@@ -79,6 +79,8 @@ pub fn scpi_write(
 }
 
 fn open_scpi_port(port: &str, baud: u32) -> Result<Box<dyn SerialPort>, String> {
+    // Retry indefinitely on busy: concurrent processes can briefly hold the port.
+    // All other errors fail immediately.
     loop {
         match serialport::new(port, baud)
             .data_bits(DataBits::Seven)
@@ -109,8 +111,9 @@ pub const CMD_GET_POS: u8 = 60;
 pub const CMD_GET_SETTING: u8 = 53;
 
 // Setting codes — fixed by Zaber binary protocol spec
-pub const SETTING_LIMIT_HOME_TRIGGERED: u32 = 103;
+pub const SETTING_TARGET_SPEED: u32 = 41;
 pub const SETTING_MAXSPEED: u32 = 42;
+pub const SETTING_LIMIT_HOME_TRIGGERED: u32 = 103;
 pub const SETTING_LIMIT_CW_TRIGGERED: u32 = 104;
 pub const SETTING_LIMIT_CCW_TRIGGERED: u32 = 105;
 pub const SETTING_DEVICE_STATUS: u32 = 54;
@@ -157,13 +160,30 @@ pub struct ZaberDriver {
 
 impl ZaberDriver {
     pub fn new(port_name: &str, baudrate: u32, device_id: u8) -> ZResult<Self> {
-        let port = serialport::new(port_name, baudrate)
-            .timeout(Duration::from_millis(1000))
-            .open()?;
+        // Retry indefinitely on busy: concurrent processes (e.g. two ramp instances)
+        // can briefly hold the port. All other errors fail immediately.
+        let port = loop {
+            match serialport::new(port_name, baudrate)
+                .timeout(Duration::from_millis(1000))
+                .open()
+            {
+                Ok(handle) => break handle,
+                Err(e) if e.to_string().contains("Device or resource busy") => {
+                    eprintln!("Port {port_name} busy, retrying in 15 s…");
+                    std::thread::sleep(Duration::from_secs(15));
+                }
+                Err(e) => return Err(ZaberError::Serial(e)),
+            }
+        };
         Ok(ZaberDriver { port, device_id })
     }
 
     fn send_command(&mut self, command: u8, data: u32) -> ZResult<ZaberResponse> {
+        // Discard any stale input before sending. The Zaber protocol emits an
+        // unsolicited STOP frame when a limit switch fires mid-move; if we don't
+        // clear it, the next read_exact pulls that frame instead of our response.
+        self.port.clear(serialport::ClearBuffer::Input).ok();
+
         // Serialise: device_id, command, data in little-endian — 6 bytes total.
         let data_le = data.to_le_bytes();
         let cmd_bytes: [u8; 6] = [
@@ -217,6 +237,10 @@ impl ZaberDriver {
     pub fn get_home_status(&mut self) -> ZResult<bool> {
         let r = self.send_command(CMD_GET_SETTING, SETTING_LIMIT_HOME_TRIGGERED)?;
         Ok(r.data != 0)
+    }
+    pub fn get_target_speed(&mut self) -> ZResult<u32> {
+        let r = self.send_command(CMD_GET_SETTING, SETTING_TARGET_SPEED)?;
+        Ok(r.data)
     }
     pub fn get_maxspeed(&mut self) -> ZResult<u32> {
         let r = self.send_command(CMD_GET_SETTING, SETTING_MAXSPEED)?;

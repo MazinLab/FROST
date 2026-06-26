@@ -23,7 +23,7 @@ use frost::serial::{
     scpi_query, scpi_write, ZaberDriver, ZaberError,
     ZaberCommand, ZaberResponse,
     CMD_HOME, CMD_MOVE_ABS, CMD_MOVE_REL, CMD_MOVE_VEL, CMD_STOP, CMD_GET_POS, CMD_GET_SETTING,
-    SETTING_LIMIT_HOME_TRIGGERED, SETTING_MAXSPEED,
+    SETTING_TARGET_SPEED, SETTING_LIMIT_HOME_TRIGGERED, SETTING_MAXSPEED,
     SETTING_LIMIT_CW_TRIGGERED, SETTING_LIMIT_CCW_TRIGGERED, SETTING_DEVICE_STATUS,
 };
 
@@ -103,6 +103,19 @@ fn zaber_driver_bad_port_is_serial_error() {
     match ZaberDriver::new("/dev/frost_no_such_port", 9600, 1) {
         Err(ZaberError::Serial(_)) => {} // expected
         Err(other) => panic!("Expected ZaberError::Serial, got: {other:?}"),
+        Ok(_) => panic!("Expected Err for nonexistent port"),
+    }
+}
+
+/// ZaberDriver::new retries on "Device or resource busy" but must fail immediately on all
+/// other errors. A nonexistent port is "No such file or directory" — not a busy error —
+/// so it must return ZaberError::Serial without entering the retry loop.
+#[test]
+fn zaber_driver_non_busy_error_does_not_retry() {
+    // If this hangs, the retry loop is catching non-busy errors.
+    match ZaberDriver::new("/dev/frost_no_such_port", 9600, 1) {
+        Err(ZaberError::Serial(_)) => {}
+        Err(other) => panic!("Expected ZaberError::Serial for non-busy failure, got: {other:?}"),
         Ok(_) => panic!("Expected Err for nonexistent port"),
     }
 }
@@ -216,8 +229,9 @@ fn zaber_command_codes_are_correct() {
 
 #[test]
 fn zaber_setting_codes_are_correct() {
-    assert_eq!(SETTING_LIMIT_HOME_TRIGGERED, 103);
+    assert_eq!(SETTING_TARGET_SPEED,          41);
     assert_eq!(SETTING_MAXSPEED,              42);
+    assert_eq!(SETTING_LIMIT_HOME_TRIGGERED, 103);
     assert_eq!(SETTING_LIMIT_CW_TRIGGERED,   104);
     assert_eq!(SETTING_LIMIT_CCW_TRIGGERED,  105);
     assert_eq!(SETTING_DEVICE_STATUS,         54);
@@ -269,4 +283,19 @@ fn hardware_zaber_home_status() {
     let mut drv = ZaberDriver::new("/dev/ttyUSB4", 9600, 1).unwrap();
     let homed = drv.get_home_status().unwrap();
     println!("Heatswitch homed: {homed}");
+}
+
+/// Confirm that close() sends the CCW move command and returns Ok(()) immediately
+/// (non-blocking — the motor continues moving after the call returns).
+/// After close() returns, a GET_POS query must succeed (port is usable).
+#[test]
+#[ignore = "requires Zaber heat switch on /dev/ttyUSB4 — motor will physically close"]
+fn hardware_heatswitch_close_stops_cleanly() {
+    use frost::heatswitch::HeatswitchController;
+    let mut hs = HeatswitchController::default();
+    hs.close().expect("close() returned an error");
+    // Verify the device is idle: a position read must succeed immediately after close().
+    let mut drv = ZaberDriver::new("/dev/ttyUSB4", 9600, 1).unwrap();
+    let pos = drv.get_position().expect("GET_POS failed after close — device may still be moving");
+    println!("Position after close: {pos} microsteps");
 }

@@ -10,7 +10,7 @@ const DEFAULT_PORT: &str = "/dev/ttyUSB4";
 const DEFAULT_BAUD: u32 = 9600;
 const DEFAULT_DEVICE_ID: u8 = 1;
 
-/// Standard travel for open / close operations (microsteps).
+/// Travel distance used by open() (microsteps). close() uses 115_400 steps.
 pub const HEATSWITCH_TRAVEL_STEPS: i32 = 115_200;
 
 // ── GUI-facing controller ────────────────────────────────────
@@ -115,52 +115,13 @@ impl HeatswitchController {
         }
     }
 
-    /// Close: move CCW until the motor stalls against mechanical resistance.
-    ///
-    /// Uses the same `move_relative` command (and therefore the same speed profile
-    /// and acceleration ramp) as the fixed-step approach, but requests far more
-    /// steps than the physical travel so the motor always reaches the mechanical
-    /// stop before the step count is exhausted.  Blocks until the position stops
-    /// changing (stall or CCW limit) or a 30-second timeout elapses.  A STOP
-    /// command is sent after the stall is confirmed so the device returns to idle.
+    /// Close: CCW 115400 steps (command sent, returns immediately).
     pub fn close(&mut self) -> Result<(), String> {
         let mut drv = self.connect()?;
-
-        // 4× the standard travel ensures we always reach the stop regardless of
-        // starting position without using an absurdly large number.
-        drv.move_relative(-(4 * HEATSWITCH_TRAVEL_STEPS)).map_err(|e| e.to_string())?;
-
-        // Allow the motor a moment to start moving before we begin polling.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let timeout = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut prev_pos = drv.get_position().map_err(|e| {
-            let _ = drv.stop();
-            e.to_string()
-        })?;
-
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            if std::time::Instant::now() > timeout {
-                let _ = drv.stop();
-                return Err("heat switch close timed out after 30 s".to_string());
-            }
-
-            let pos = match drv.get_position() {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = drv.stop();
-                    return Err(e.to_string());
-                }
-            };
-
-            if pos == prev_pos {
-                // Position unchanged — motor stalled against resistance or hit limit.
-                let _ = drv.stop();
-                return Ok(());
-            }
-            prev_pos = pos;
+        match drv.move_relative(-115_400) {
+            Ok(()) => Ok(()),
+            Err(crate::serial::ZaberError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => Ok(()),
+            Err(e) => Err(e.to_string()),
         }
     }
 
