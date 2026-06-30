@@ -699,11 +699,13 @@ fn run_heatswitch(ctrl: &mut HeatswitchController, cmd: HeatswitchCmd) -> Result
         }
         HeatswitchCmd::Open => {
             ctrl.open()?;
+            crate::worker::set_heatswitch_open_state(true);
             println!("Open command sent (CW {} steps). Motor is moving.", HEATSWITCH_TRAVEL_STEPS);
             Ok(())
         }
         HeatswitchCmd::Close => {
             ctrl.close()?;
+            crate::worker::set_heatswitch_open_state(false);
             println!("Close command sent (CCW {} steps). Motor is moving.", HEATSWITCH_TRAVEL_STEPS);
             Ok(())
         }

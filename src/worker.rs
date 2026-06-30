@@ -13,6 +13,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::compressor::CryomechController;
+use crate::heatswitch::HeatswitchController;
 use crate::lakeshore350::LakeShore350Controller;
 use crate::lakeshore370::LakeShore370Controller;
 use crate::lakeshore625::LakeShore625Controller;
@@ -147,6 +148,30 @@ pub fn clear_gl7_output_state() {
     let _ = fs::remove_file(GL7_OUTPUTS_PATH);
 }
 
+/// Write "open" or "closed" to the heatswitch state file.
+pub fn set_heatswitch_open_state_at(path: &Path, is_open: bool) {
+    ensure_parent(path);
+    let _ = fs::write(path, if is_open { "open" } else { "closed" });
+}
+
+pub fn set_heatswitch_open_state(is_open: bool) {
+    set_heatswitch_open_state_at(Path::new(HEATSWITCH_OPEN_PATH), is_open);
+}
+
+/// Returns Some(true) = open, Some(false) = closed, None = file absent or unrecognised.
+pub fn get_heatswitch_open_state_at(path: &Path) -> Option<bool> {
+    let content = fs::read_to_string(path).ok()?;
+    match content.trim() {
+        "open"   => Some(true),
+        "closed" => Some(false),
+        _        => None,
+    }
+}
+
+pub fn get_heatswitch_open_state() -> Option<bool> {
+    get_heatswitch_open_state_at(Path::new(HEATSWITCH_OPEN_PATH))
+}
+
 /// Returns the PID stored in the GL7 cooldown lock file **only if that
 /// process is still running**.  A dead process cannot have cleared the
 /// file itself (it crashed), so this check prevents a stale lock from
@@ -242,6 +267,12 @@ pub struct DeviceSnapshot {
     pub adr_status_line:  String,
     /// Set when the user manually stops the ramp; suppresses the thread's result write.
     pub adr_ramp_was_stopped: bool,
+
+    // ── Heatswitch ────────────────────────────────────────────
+    /// None = state file absent (never set); Some(true) = open; Some(false) = closed.
+    pub heatswitch_is_open: Option<bool>,
+    /// Drained by GUI each frame: Some(Ok) = command succeeded, Some(Err) = failed.
+    pub heatswitch_cmd_result: Option<Result<(), String>>,
 }
 
 impl Default for DeviceSnapshot {
@@ -283,6 +314,8 @@ impl Default for DeviceSnapshot {
             adr_log_lines:    Vec::new(),
             adr_status_line:  String::new(),
             adr_ramp_was_stopped: false,
+            heatswitch_is_open:    None,
+            heatswitch_cmd_result: None,
         }
     }
 }
@@ -299,6 +332,8 @@ pub enum GuiCommand {
     StopRecording,
     /// Update `DeviceSnapshot::gl7_cooldown_active` to reflect subprocess state.
     Gl7CooldownActive(bool),
+    OpenHeatswitch,
+    CloseHeatswitch,
 }
 
 // ── Public worker handle ───────────────────────────────────────
@@ -330,6 +365,8 @@ impl SerialWorker {
             // Restore GL7 cooldown state: if the lock file exists the subprocess
             // was running when the GUI last closed.
             s.gl7_cooldown_active = get_gl7_cooldown_pid().is_some();
+            // Restore heatswitch open/closed state from the state file.
+            s.heatswitch_is_open = get_heatswitch_open_state();
         }
 
         let (cmd_tx, cmd_rx) = channel::<GuiCommand>();
@@ -418,6 +455,18 @@ fn worker_loop(
             let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
             if s.gl7_cooldown_active != lock_active {
                 s.gl7_cooldown_active = lock_active;
+                drop(s);
+                ctx.request_repaint();
+            }
+        }
+
+        // Sync heatswitch state from the lock file so that CLI and ADR ramp
+        // changes are reflected in the GUI toggle without a restart.
+        {
+            let file_state = get_heatswitch_open_state();
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            if s.heatswitch_is_open != file_state {
+                s.heatswitch_is_open = file_state;
                 drop(s);
                 ctx.request_repaint();
             }
@@ -593,6 +642,26 @@ fn execute_command(cmd: GuiCommand, state: &mut WorkerState, snap: &Arc<Mutex<De
 
         GuiCommand::Gl7CooldownActive(active) => {
             snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_cooldown_active = active;
+        }
+
+        GuiCommand::OpenHeatswitch => {
+            let mut ctrl = HeatswitchController::default();
+            let result = ctrl.open();
+            let ok = result.is_ok();
+            if ok { set_heatswitch_open_state(true); }
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            if ok { s.heatswitch_is_open = Some(true); }
+            s.heatswitch_cmd_result = Some(result);
+        }
+
+        GuiCommand::CloseHeatswitch => {
+            let mut ctrl = HeatswitchController::default();
+            let result = ctrl.close();
+            let ok = result.is_ok();
+            if ok { set_heatswitch_open_state(false); }
+            let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+            if ok { s.heatswitch_is_open = Some(false); }
+            s.heatswitch_cmd_result = Some(result);
         }
 
         GuiCommand::RunAdrRamp => {

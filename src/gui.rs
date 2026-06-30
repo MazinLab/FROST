@@ -52,6 +52,9 @@ struct FrostApp {
     magnet_compliance_set_msg: Option<Result<(), String>>,
     gl7_set_msg: Vec<Option<Result<(), String>>>,
 
+    // ── Heatswitch ────────────────────────────────────────────
+    heatswitch_error: Option<String>,
+
     // ── GL7 cooldown ─────────────────────────────────────────
     gl7_cooldown_csv_path: String,
     gl7_cooldown_result:   Option<Result<String, String>>,
@@ -92,6 +95,7 @@ impl FrostApp {
             magnet_rate_set_msg:       None,
             magnet_compliance_set_msg: None,
             gl7_set_msg: vec![None, None, None, None],
+            heatswitch_error:      None,
             gl7_cooldown_csv_path: String::new(),
             gl7_cooldown_result:   None,
             gl7_cooldown_child:    None,
@@ -156,6 +160,12 @@ impl eframe::App for FrostApp {
             if let Some(r) = s.recording_start_result.take() {
                 self.record_result = Some(r);
             }
+            if let Some(r) = s.heatswitch_cmd_result.take() {
+                match r {
+                    Ok(())  => self.heatswitch_error = None,
+                    Err(e)  => self.heatswitch_error = Some(e),
+                }
+            }
 
             s.clone()
         };
@@ -179,16 +189,63 @@ impl eframe::App for FrostApp {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(8.0);
 
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("FROST")
-                            .size(48.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(30, 30, 120)),
-                    )
-                    .selectable(false),
-                );
-                ui.label("Fridge Remote Operations, Status, and Thermometry");
+                // Header row: FROST title on the left, heatswitch toggle on the right.
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("FROST")
+                                    .size(48.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(30, 30, 120)),
+                            )
+                            .selectable(false),
+                        );
+                        ui.label("Fridge Remote Operations, Status, and Thermometry");
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let is_open = snap.heatswitch_is_open;
+                        // right_to_left: first added → rightmost. Visual order left→right:
+                        //   "Heatswitch"  [toggle]  OPEN/CLOSED
+                        let (state_label, state_color) = match is_open {
+                            Some(true)  => ("OPEN",    egui::Color32::from_rgb(20, 140, 20)),
+                            Some(false) => ("CLOSED",  egui::Color32::from_rgb(140, 30, 30)),
+                            None        => ("UNKNOWN", egui::Color32::from_rgb(130, 100, 0)),
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(state_label)
+                                    .strong()
+                                    .size(16.0)
+                                    .color(state_color),
+                            )
+                            .selectable(false),
+                        );
+                        ui.add_space(6.0);
+                        let resp = self.heatswitch_toggle(ui, is_open);
+                        if resp.clicked() {
+                            self.heatswitch_error = None;
+                            match is_open {
+                                Some(true) => self.worker.send(GuiCommand::CloseHeatswitch),
+                                _          => self.worker.send(GuiCommand::OpenHeatswitch),
+                            }
+                        }
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("Heatswitch")
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(100, 100, 140)),
+                            )
+                            .selectable(false),
+                        );
+                    });
+                });
+
+                if let Some(ref e) = self.heatswitch_error {
+                    ui.colored_label(egui::Color32::RED, format!("Heatswitch error: {e}"));
+                }
 
                 ui.add_space(14.0);
                 ui.separator();
@@ -246,10 +303,11 @@ impl FrostApp {
         let gl7_active = outputs_on || head3_cold || snap.gl7_cooldown_active;
 
         let chips: &[(&str, bool)] = &[
-            ("Compressor", snap.compressor_running),
-            ("ADR Ramp",   snap.adr_ramp_running),
-            ("GL7",        gl7_active),
-            ("Recording",  is_recording),
+            ("Compressor",  snap.compressor_running),
+            ("ADR Ramp",    snap.adr_ramp_running),
+            ("GL7",         gl7_active),
+            ("Recording",   is_recording),
+            ("Heatswitch",  snap.heatswitch_is_open == Some(true)),
         ];
 
         ui.horizontal(|ui| {
@@ -384,6 +442,71 @@ impl FrostApp {
         } else {
             ui.label("Compressor status: (pending first poll…)");
         }
+    }
+
+    /// Draw a physical toggle switch.  Returns the allocated response so the
+    /// caller can detect clicks.  Thumb sits LEFT when open, RIGHT when closed.
+    fn heatswitch_toggle(&self, ui: &mut egui::Ui, is_open: Option<bool>) -> egui::Response {
+        let track_w = 120.0f32;
+        let track_h = 40.0f32;
+        let thumb_r = 15.0f32;
+
+        let desired_size = egui::vec2(track_w, track_h);
+        let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+
+            let track_color = match is_open {
+                Some(true)  => egui::Color32::from_rgb(28, 155, 72),
+                Some(false) => egui::Color32::from_rgb(62, 72, 92),
+                None        => egui::Color32::from_rgb(135, 108, 28),
+            };
+            painter.rect_filled(rect, egui::Rounding::same(track_h / 2.0), track_color);
+
+            if response.hovered() {
+                painter.rect_filled(
+                    rect,
+                    egui::Rounding::same(track_h / 2.0),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+                );
+            }
+
+            let center_y = rect.center().y;
+            let label_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 170);
+            let font = egui::FontId::proportional(11.5);
+
+            painter.text(
+                egui::Pos2::new(rect.left() + 13.0, center_y),
+                egui::Align2::LEFT_CENTER,
+                "OPEN",
+                font.clone(),
+                label_color,
+            );
+            painter.text(
+                egui::Pos2::new(rect.right() - 13.0, center_y),
+                egui::Align2::RIGHT_CENTER,
+                "CLOSE",
+                font,
+                label_color,
+            );
+
+            let thumb_x = match is_open {
+                Some(true)  => rect.left()   + thumb_r + 3.0,
+                Some(false) => rect.right()  - thumb_r - 3.0,
+                None        => rect.center().x,
+            };
+            let thumb_center = egui::Pos2::new(thumb_x, center_y);
+
+            painter.circle_filled(thumb_center, thumb_r, egui::Color32::WHITE);
+            painter.circle_stroke(
+                thumb_center,
+                thumb_r,
+                egui::Stroke::new(1.5, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 55)),
+            );
+        }
+
+        response
     }
 
     fn show_magnet_section(&mut self, ui: &mut egui::Ui, snap: &DeviceSnapshot, _ctx: &egui::Context) {

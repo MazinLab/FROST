@@ -209,6 +209,7 @@ pub fn run_adr_ramp(
         return Err(format!("Heat switch open failed: {e}"));
     }
     ll("[ADR]           ✓ Heat switch open command sent.  Motor is moving.".to_string());
+    crate::worker::set_heatswitch_open_state(true);
 
     // ── Step 5: Wait for heat switch to fully open ────────────────────────────
     ll("[ADR] Step 5/7 — Waiting 3 minutes for heat switch to fully open...".to_string());
