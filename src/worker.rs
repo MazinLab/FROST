@@ -109,6 +109,39 @@ pub fn get_adr_ramp_pid() -> Option<u32> {
     get_adr_ramp_pid_at(Path::new(ADR_RAMP_RUNNING_PATH))
 }
 
+const ADR_CRASH_RECOVERY_CURRENT_THRESHOLD: f64 = 0.5;
+
+/// Called once at startup when the ADR ramp lock file existed but the
+/// subprocess is dead. Reads the LS625 current and ramps to zero if
+/// the magnet is still energized above the threshold.
+fn recover_crashed_adr_ramp() {
+    eprintln!("[ADR] Ramp process crashed — checking magnet current...");
+    let mut ls625 = crate::lakeshore625::LakeShore625Controller::default();
+    match ls625.get_current() {
+        Ok(raw) => match raw.trim().parse::<f64>() {
+            Ok(current) if current > ADR_CRASH_RECOVERY_CURRENT_THRESHOLD => {
+                eprintln!(
+                    "[ADR] Magnet current is {:.3} A (>{} A threshold) — sending set_current(0.0) to ramp down.",
+                    current, ADR_CRASH_RECOVERY_CURRENT_THRESHOLD
+                );
+                if let Err(e) = ls625.set_current(0.0) {
+                    eprintln!("[ADR] WARNING: failed to zero magnet current: {e}");
+                }
+            }
+            Ok(current) => {
+                eprintln!("[ADR] Magnet current is {:.3} A — no recovery needed.", current);
+            }
+            Err(_) => {
+                eprintln!("[ADR] WARNING: could not parse magnet current '{raw}' for crash recovery");
+            }
+        },
+        Err(e) => {
+            eprintln!("[ADR] WARNING: could not read magnet current for crash recovery: {e}");
+        }
+    }
+    clear_adr_magnet_readout();
+}
+
 /// Write the GL7 cooldown lock file, storing the subprocess PID.
 pub const GL7_COOLDOWN_RUNNING_PATH: &str = "state/.gl7_cooldown_running";
 
@@ -403,10 +436,19 @@ impl SerialWorker {
             // Seed compressor_running from the intent file so the button shows the
             // correct label immediately, before the first 30-second poll completes.
             s.compressor_running = is_compressor_intent();
-            // Restore ADR ramp state: if the subprocess is still alive (PID check),
-            // show the Stop button immediately.  A dead process cannot have cleared
-            // the file itself, so get_adr_ramp_pid() detects and removes stale files.
-            s.adr_ramp_running = get_adr_ramp_pid().is_some();
+
+            // Restore ADR ramp state. Check whether the lock file exists BEFORE
+            // get_adr_ramp_pid() which cleans up stale files — if the file exists
+            // but the PID is dead, the ramp process crashed and the magnet may
+            // still be energized.
+            let ramp_lock_existed = is_adr_ramp_persisted();
+            let ramp_pid_alive = get_adr_ramp_pid().is_some();
+            s.adr_ramp_running = ramp_pid_alive;
+
+            if ramp_lock_existed && !ramp_pid_alive {
+                recover_crashed_adr_ramp();
+            }
+
             // Restore GL7 cooldown state: if the lock file exists the subprocess
             // was running when the GUI last closed.
             s.gl7_cooldown_active = get_gl7_cooldown_pid().is_some();
