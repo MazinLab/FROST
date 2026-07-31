@@ -114,7 +114,7 @@ The GUI is divided into five sections displayed top-to-bottom. A fixed status ba
 
 **Status Bar**
 - Always-visible strip at the very top showing a one-line system summary
-- Four indicator chips: **Compressor**, **ADR Ramp**, **GL7**, **Recording**
+- Five indicator chips: **Compressor**, **ADR Ramp**, **GL7**, **Recording**, **Heatswitch**
 - Chip is green (active) or dark/muted (inactive)
 - GL7 is considered active if any heater/switch output is non-zero or a cooldown subprocess is alive
 
@@ -149,6 +149,8 @@ The GUI is divided into five sections displayed top-to-bottom. A fixed status ba
 ```
 frost <device> [OPTIONS] <command> [ARGS]
 ```
+
+Run `frost --help` for the full list of devices and commands, or `frost <device> --help` for device-specific options.
 
 ### `frost adr` — ADR Operations
 
@@ -324,13 +326,7 @@ Logs are written to `temps/YYYY-MM-DD_temperature_log.csv`. If a file already ex
 
 ### `frost safety` — Start-Safety Interlocks
 
-```bash
-frost safety status   # Print whether safety is ON or OFF
-frost safety off      # Bypass start interlocks (persists across restarts)
-frost safety on       # Re-enable start interlocks
-```
-
-Controls the interlocks that gate ADR/GL7/manual-output starts. See [Safety Interlocks](#safety-interlocks) for the full behavior.
+See [Safety Interlocks](#safety-interlocks) for the full behavior and CLI usage.
 
 ---
 
@@ -349,48 +345,25 @@ The `frost gl7` commands automate the cooldown of a Chase Research Cryogenics GL
 
 ### CLI commands
 
-```bash
-frost gl7 <subcommand> --csv <path>
-```
-
-All subcommands require `--csv` pointing to the temperature log written by `frost record-temps loop`.
+All subcommands require `--csv` pointing to the temperature log written by `frost record-temps loop`. Run `frost gl7 --help` for the full list of options and per-phase flags.
 
 ```bash
-# Check preconditions before starting a cooldown (Phase 0)
-frost gl7 check --csv temps/YYYY-MM-DD_temperature_log.csv
-
-# Ramp both pumps up (Phase 1)
-frost gl7 ramp-pumps --csv temps/YYYY-MM-DD_temperature_log.csv
-
-# Stabilize pumps, wait for heads to cool (Phase 2)
-# --out1 and --out2 are the output percentages handed off from Phase 1
-# (defaults: 25.0% and 18.0% if running Phase 2 standalone)
-frost gl7 stabilize --csv temps/YYYY-MM-DD_temperature_log.csv
-frost gl7 stabilize --csv temps/... --out1 25.0 --out2 18.0
-
-# Cycle ⁴He module (Phase 3)
-# --out2 is the 3-pump output % handed off from Phase 2 (default 18.0%)
-frost gl7 cycle-4he --csv temps/YYYY-MM-DD_temperature_log.csv
-frost gl7 cycle-4he --csv temps/... --out2 18.0
-
-# Cycle ³He module (Phase 4)
-# --out3 is the 4-switch output % handed off from Phase 3 (default 40.0%)
-frost gl7 cycle-3he --csv temps/YYYY-MM-DD_temperature_log.csv
-frost gl7 cycle-3he --csv temps/... --out3 40.0
-
-# Monitor at base temperature (Phase 5)
-# --out3/--out4 are switch heater percentages handed off from Phase 4 (default 40.0% each)
-frost gl7 running --csv temps/YYYY-MM-DD_temperature_log.csv
-frost gl7 running --csv temps/... --out3 40.0 --out4 40.0
-
-# Run the full automated sequence: Phase 0 → Phase 5
+# Run the full automated sequence (Phase 0 → 5)
 frost gl7 cooldown --csv temps/YYYY-MM-DD_temperature_log.csv
+
+# Or run individual phases (each accepts --outN flags for manual handoff)
+frost gl7 check      --csv temps/...   # Phase 0: verify outputs at 0%
+frost gl7 ramp-pumps --csv temps/...   # Phase 1: ramp up both pumps
+frost gl7 stabilize  --csv temps/...   # Phase 2: hold pumps, wait for heads to cool
+frost gl7 cycle-4he  --csv temps/...   # Phase 3: cycle ⁴He module
+frost gl7 cycle-3he  --csv temps/...   # Phase 4: cycle ³He module
+frost gl7 running    --csv temps/...   # Phase 5: monitor at base temperature
 ```
 
 ### Phase sequence
 
 ```
-Phase 0: Precondition check  (~instant)
+Phase 0: Output check  (~instant)
 Phase 1: Ramp up both pumps  (~25 min)
 Phase 2: Stabilize pumps, heads cool  (~60–90 min)
 Phase 3: Cycle ⁴He module  (~60–75 min)
@@ -402,7 +375,7 @@ Phase 5: Running at base temperature  (~36 hours)
 
 ### Phase details
 
-**Phase 0 — Precondition check:** Verifies all LS350 outputs are at 0% before starting. Thermal preconditions (4K stage, heads, pumps, switches) are enforced by the start-safety interlock (compressor running + 4K stage < 4.2K) rather than Phase 0.
+**Phase 0 — Output check:** Verifies all LS350 outputs are at 0% before starting. Thermal preconditions are enforced by the [safety interlocks](#safety-interlocks) (compressor running + 4K stage < 4.2K) at the point the cooldown is launched.
 
 **Phase 1 — Ramp up:** Executes a fixed time-based ramp schedule (30%→50%→80% for Output 1, 30%→50%→60% for Output 2 over 90 seconds), then holds at 80%/60% and polls every 30 s. Once the 4-pump reaches 45K, Output 1 is stepped down by 8% per poll until it reaches 25%. Once the 3-pump reaches 42K, Output 2 is stepped down by 8% per poll until it reaches 18%. The two pumps step down independently. Phase 1 exits when both outputs have reached their floors (25% / 18%).
 
@@ -435,29 +408,9 @@ These override all phase logic at every iteration:
 
 ### Typical workflow
 
-**Via GUI (recommended):**
-1. In the Thermometry section, click **Record Temperatures** to start logging
-2. In the GL7 Sorption Cooler section, click **Current Temperature Recording** to auto-fill the CSV path, then click **Start GL7 Cooldown**
+**GUI:** Click **Record Temperatures** to start logging, then in the GL7 section click **Current Temperature Recording** to auto-fill the CSV path and **Start GL7 Cooldown**.
 
-**Via CLI:**
-```bash
-# 1. Start temperature recording (run in a tmux pane — must stay running)
-frost record-temps loop --interval 30
-
-# 2. In another pane, run the full cooldown
-frost gl7 cooldown --csv temps/YYYY-MM-DD_temperature_log.csv
-```
-
-Or, to run phases individually with the ability to intervene between steps:
-
-```bash
-frost gl7 check      --csv temps/...
-frost gl7 ramp-pumps --csv temps/...
-frost gl7 stabilize  --csv temps/...
-frost gl7 cycle-4he  --csv temps/...
-frost gl7 cycle-3he  --csv temps/...
-frost gl7 running    --csv temps/...
-```
+**CLI:** Start temperature recording in one tmux pane (`frost record-temps loop`), then run `frost gl7 cooldown --csv temps/...` in another. Individual phases can be run separately if manual intervention is needed between steps.
 
 ---
 
@@ -483,58 +436,24 @@ FROST enforces start-safety interlocks before any potentially-dangerous operatio
 
 - **Start-only.** The interlock is checked **once**, at the moment a process starts. It is never re-evaluated during a run — if the 4K stage rises above 4.2 K while an ADR ramp or GL7 cooldown is in progress, the process is **not** stopped.
 - **Fail-safe.** If a required reading cannot be obtained (serial error, sensor overrange, wrong port), the start is **blocked**, not allowed.
-- **Persistent override.** Safety defaults to **ON** and can be toggled OFF to bypass the interlocks. The state is stored in `$HOME/.frost/safety_disabled` (present = OFF), shared between the CLI and GUI, and survives restarts and sessions. If `$HOME` is unavailable it falls back to `state/.safety_disabled`.
-- **Failure audit log.** Every blocked start (and any failed safety toggle) is announced on stderr and appended with a timestamp to `logs/safety_log.txt`. Only failures are logged — never passes.
-
-### CLI
-
-```bash
-frost safety status   # Print whether safety is ON or OFF
-frost safety off      # Bypass interlocks (persists across restarts)
-frost safety on       # Re-enable interlocks
-```
-
-If a blocked start occurs, the command exits with an error naming the failed condition(s), e.g.:
-
-```
-Error: ADR ramp blocked by safety interlock: compressor is not running. To override, run `frost safety off` or toggle the GUI Safety button.
-```
-
-### GUI
-
-A **Safety: ON / OFF** toggle button sits at the top of the window — green when ON, red when OFF. Clicking it flips and persists the state. While safety is OFF, a red **"⚠ Safety OFF — start interlocks are bypassed"** banner is shown. A blocked start reports its reason in the relevant section's status line instead of launching.
+- **Persistent override.** Safety defaults to **ON** and can be toggled OFF via `frost safety off` (CLI) or the **Safety: ON / OFF** button in the GUI. The state is stored in `$HOME/.frost/safety_disabled`, shared between CLI and GUI, and survives restarts. Use `frost safety status` to check the current state; `frost safety on` to re-enable.
+- **Failure audit log.** Every blocked start is announced on stderr and appended with a timestamp to `logs/safety_log.txt`. A blocked CLI command exits with an error naming the failed condition(s).
 
 ---
 
 ## Data Logging
 
-### Ramp Logs
+Both log types auto-increment filenames (`_2.csv`, `_3.csv`, …) when a file for the current date already exists.
 
-Written during `frost adr ramp` or `frost adr logging`. Location: `ramps/`
+| Log | Location | Written by | Interval |
+|-----|----------|-----------|----------|
+| Ramp | `ramps/YYYY-MM-DD_ramp_log.csv` | `frost adr ramp` / `frost adr logging` | 1 row/min |
+| Temperature | `temps/YYYY-MM-DD_temperature_log.csv` | `frost record-temps loop` / GUI recording | 30 s (configurable) |
 
-```
-ramps/YYYY-MM-DD_ramp_log.csv
-ramps/YYYY-MM-DD_ramp_log_2.csv   # if first file exists, auto-increments
-```
-
-Columns: `Timestamp, Rate, Current, Voltage, Field, Error Status`
-Interval: 1 row per minute
-
-### Temperature Logs
-
-Written during `frost record-temps loop` or via the GUI recording controls. Location: `temps/`
-
-```
-temps/YYYY-MM-DD_temperature_log.csv
-temps/YYYY-MM-DD_temperature_log_2.csv
-```
-
-Columns (17 total, fixed-width space-padded):
+**Temperature CSV columns** (17 total, fixed-width space-padded):
 `Timestamp, Date, Time, 4K_Stage_Temp, Switch_Volt, Switch_Temp, 3Head_Res, 3Head_Temp, 4Head_Res_Raw, 4Head_Res_Adj, 4Head_Temp, 3Pump_Volt, 3Pump_Temp, 4Pump_Volt, 4Pump_Temp, Device_Stage_Res, Device_Stage_Temp`
 
-`Switch_Temp` (`Switch_Temp_K`) is the **4-switch temperature** (LS350 D2). It is the primary feedback signal for Output 3 regulation in phases 3–5 of the GL7 cooldown.
-
-Interval: 30 seconds (default), configurable with `--interval`
+`Switch_Temp` (`Switch_Temp_K`) is the **4-switch temperature** (LS350 D2) — the primary feedback signal for Output 3 regulation in GL7 phases 3–5.
 
 ---
 
