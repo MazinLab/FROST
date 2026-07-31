@@ -412,7 +412,7 @@ fn switch_too_hot_clamps_to_floor() {
 fn write_temp_csv(rows: &[&str]) -> tempfile::NamedTempFile {
     let mut f = tempfile::NamedTempFile::new().unwrap();
     // Header + separator matching the record_temps.rs fixed-width format.
-    writeln!(f, "Timestamp           Date       Time     4K_Stage  ADR_Res   ADR_Temp  Switch_Volt Switch_Temp 3Head_Res 3Head_Temp 4Head_Res_Raw 4Head_Res_Adj 4Head_Temp 3Pump_Volt 3Pump_Temp 4Pump_Volt 4Pump_Temp LS370_In1_Res LS370_In1_Temp").unwrap();
+    writeln!(f, "Timestamp           Date       Time     4K_Stage  Switch_Volt Switch_Temp 3Head_Res 3Head_Temp 4Head_Res_Raw 4Head_Res_Adj 4Head_Temp 3Pump_Volt 3Pump_Temp 4Pump_Volt 4Pump_Temp Device_Stage_Res Device_Stage_Temp").unwrap();
     writeln!(f, "---").unwrap();
     for row in rows {
         writeln!(f, "{}", row).unwrap();
@@ -422,12 +422,12 @@ fn write_temp_csv(rows: &[&str]) -> tempfile::NamedTempFile {
 
 /// Build a whitespace-delimited row with the six temperatures at the expected
 /// column indices (0-based):
-///   3  → stage_4k,  7 → switch,  9 → head3, 12 → head4, 14 → pump3, 16 → pump4
+///   3 → stage_4k, 5 → switch, 7 → head3, 10 → head4, 12 → pump3, 14 → pump4
 fn make_row(stage: f64, switch: f64, head3: f64, head4: f64, pump3: f64, pump4: f64) -> String {
-    // Columns: 0=ts 1=date 2=time 3=stage 4=x 5=x 6=x 7=switch 8=x 9=head3
-    //          10=x 11=x 12=head4 13=x 14=pump3 15=x 16=pump4
+    // Columns: 0=ts 1=date 2=time 3=stage 4=x 5=switch 6=x 7=head3
+    //          8=x 9=x 10=head4 11=x 12=pump3 13=x 14=pump4
     format!(
-        "1234567890 2025-01-01 12:00:00 {stage:.3} 0.0 0.0 0.0 {switch:.3} 0.0 {head3:.3} 0.0 0.0 {head4:.3} 0.0 {pump3:.3} 0.0 {pump4:.3}"
+        "1234567890 2025-01-01 12:00:00 {stage:.3} 0.0 {switch:.3} 0.0 {head3:.3} 0.0 0.0 {head4:.3} 0.0 {pump3:.3} 0.0 {pump4:.3}"
     )
 }
 
@@ -667,11 +667,18 @@ fn parse_u64_const(src: &str, name: &str) -> Option<u64> {
 
 // ── Phase 5: output write constraints ────────────────────────────────────────
 
-/// Phase 5 regulates Output 3 (4-switch) to keep it in the 20–22 K range via
-/// `switch_control_step`, but must never directly write Outputs 1, 2, or 4.
-/// Verify both sides of this contract.
+/// Phase 5 contract:
+///  * Output 3 (4-switch) is regulated to the 20–22 K range via
+///    `switch_control_step`, which is applied by writing the computed value to
+///    Output 3 during the run.
+///  * Outputs 1 and 2 (pumps) are never written — they were zeroed in Phases
+///    3 and 4 and must stay off.
+///  * Output 4 (3-switch) is held at its Phase 4 value during the run and may
+///    be written directly ONLY as the end-of-life power-down to 0%.
+///  * At end of life both heat switches are closed (Output 3 and Output 4 → 0%).
+/// Verify every side of this contract.
 #[test]
-fn phase5_only_regulates_output3_via_switch_control_step() {
+fn phase5_only_regulates_output3_and_powers_down_at_end_of_life() {
     let body = phase5_source();
 
     // Strip comment lines so the check targets live code only.
@@ -687,16 +694,36 @@ fn phase5_only_regulates_output3_via_switch_control_step() {
         "phase5_running must call switch_control_step to regulate Output 3"
     );
 
-    // Must not directly set Output 1, 2, or 4 (pumps and 3-switch are fixed).
-    for output in [1u8, 2, 4] {
-        // Look for the pattern `set_output_pct(..., OUTPUT,` — this matches
-        // calls that hard-code the output number as a literal.
+    // Must never directly write Output 1 or 2 (pumps stay off in Phase 5).
+    for output in [1u8, 2] {
         let pattern = format!("set_output_pct(&mut ls350, {},", output);
         assert!(
             !live.contains(&pattern),
-            "phase5_running must not directly set Output {output} — only Output 3 (via switch_control_step) is allowed"
+            "phase5_running must not set Output {output} — pumps remain off in Phase 5"
         );
     }
+
+    // Output 4 is fixed during the run: any direct write must be the shutdown
+    // to 0% — never a drive to a nonzero value.
+    let out4_prefix = "set_output_pct(&mut ls350, 4,";
+    for line in live.lines().filter(|l| l.contains(out4_prefix)) {
+        assert!(
+            line.contains("0.0"),
+            "phase5_running may only write Output 4 as an end-of-life shutdown to 0% \
+             — found a nonzero direct write: {}",
+            line.trim()
+        );
+    }
+
+    // The end-of-life shutdown of both heat switches must be present.
+    assert!(
+        live.contains("set_output_pct(&mut ls350, 3, 0.0)"),
+        "phase5_running must close the 4-switch (Output 3 → 0%) at end of life"
+    );
+    assert!(
+        live.contains("set_output_pct(&mut ls350, 4, 0.0)"),
+        "phase5_running must close the 3-switch (Output 4 → 0%) at end of life"
+    );
 }
 
 // ── Phase 5: constants match spec ─────────────────────────────────────────────

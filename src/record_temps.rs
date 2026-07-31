@@ -25,29 +25,26 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 // Order mirrors record_temps.py: D3 → B → D2 → A → C → D4 → D5 → LS370
 // Widths mirror self.column_widths in record_temps.py, with LS370 appended.
 const HEADERS: &[&str] = &[
-    "Timestamp",           // 28
-    "Date",                // 12
-    "Time",                // 12
-    "4K_Stage_Temp_K",     // 17  (LS350 D3 kelvin)
-    "ADR_Res_Ohm",         // 16  (LS350 B sensor Ω)
-    "ADR_Temp_K",          // 15  (LS350 B kelvin)
-    "Switch_Volt",         // 17  (LS350 D2 sensor V)
-    "Switch_Temp_K",       // 17  (LS350 D2 calibrated K)
-    "3_Head_Res_Ohm",      // 20  (LS350 A sensor Ω)
-    "3_Head_Temp_K",       // 18  (LS350 A calibrated K)
-    "4_Head_Res_Raw_Ohm",  // 20  (LS350 C sensor Ω raw)
-    "4_Head_Res_Adj_Ohm",  // 20  (LS350 C sensor + 34.56 Ω)
-    "4_Head_Temp_K",       // 16  (LS350 C calibrated K)
-    "3_Pump_Volt",         // 17  (LS350 D4 sensor V)
-    "3_Pump_Temp_K",       // 16  (LS350 D4 calibrated K)
-    "4_Pump_Volt",         // 17  (LS350 D5 sensor V)
-    "4_Pump_Temp_K",       // 16  (LS350 D5 calibrated K)
-    "LS370_In1_Res_Ohm",   // 22  (LS370 input 1 resistance Ω)
-    "LS370_In1_Temp_K",    // 18  (LS370 input 1 kelvin)
+    "Timestamp",              // 28
+    "Date",                   // 12
+    "Time",                   // 12
+    "4K_Stage_Temp_K",        // 17  (LS350 D3 kelvin)
+    "Switch_Volt",            // 17  (LS350 D2 sensor V)
+    "Switch_Temp_K",          // 17  (LS350 D2 calibrated K)
+    "3_Head_Res_Ohm",         // 20  (LS350 A sensor Ω)
+    "3_Head_Temp_K",          // 18  (LS350 A calibrated K)
+    "4_Head_Res_Raw_Ohm",     // 20  (LS350 C sensor Ω raw)
+    "4_Head_Res_Adj_Ohm",     // 20  (LS350 C sensor + 34.56 Ω)
+    "4_Head_Temp_K",          // 16  (LS350 C calibrated K)
+    "3_Pump_Volt",            // 17  (LS350 D4 sensor V)
+    "3_Pump_Temp_K",          // 16  (LS350 D4 calibrated K)
+    "4_Pump_Volt",            // 17  (LS350 D5 sensor V)
+    "4_Pump_Temp_K",          // 16  (LS350 D5 calibrated K)
+    "Device_Stage_Res_Ohm",   // 22  (LS370 input 1 resistance Ω)
+    "Device_Stage_Temp_K",    // 22  (LS370 input 1 kelvin)
 ];
 
-// Matches record_temps.py column_widths, extended for LS370
-const WIDTHS: &[usize] = &[28, 12, 12, 17, 16, 15, 17, 17, 20, 18, 20, 20, 16, 17, 16, 17, 16, 22, 18];
+const WIDTHS: &[usize] = &[28, 12, 12, 17, 17, 17, 20, 18, 20, 20, 16, 17, 16, 17, 16, 22, 22];
 
 // ── Recording-active lock file ─────────────────────────────────
 // Written by start_recording_loop(); deleted when the loop stops.
@@ -128,8 +125,6 @@ impl TemperatureRecord {
             self.date.clone(),
             self.time.clone(),
             fmt_val(self.d3_temp_k,    2),
-            fmt_val(self.b_sensor_ohm, 4),
-            fmt_val(self.b_temp_k,     3),
             fmt_val(self.d2_sensor_v,  2),
             fmt_val(self.d2_temp_k,    2),
             fmt_val(self.a_sensor_ohm, 4),

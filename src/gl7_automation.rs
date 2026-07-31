@@ -193,16 +193,16 @@ pub fn read_latest_temps(csv_path: &str) -> Result<TempSnapshot, String> {
 /// the required columns cannot be parsed as f64.
 fn parse_csv_row(line: &str) -> Option<TempSnapshot> {
     let cols: Vec<&str> = line.split_whitespace().collect();
-    if cols.len() < 17 {
+    if cols.len() < 15 {
         return None;
     }
     Some(TempSnapshot {
         stage_4k_k: cols[3].parse().ok()?,
-        switch_k:   cols[7].parse().ok()?,
-        head3_k:    cols[9].parse().ok()?,
-        head4_k:    cols[12].parse().ok()?,
-        pump3_k:    cols[14].parse().ok()?,
-        pump4_k:    cols[16].parse().ok()?,
+        switch_k:   cols[5].parse().ok()?,
+        head3_k:    cols[7].parse().ok()?,
+        head4_k:    cols[10].parse().ok()?,
+        pump3_k:    cols[12].parse().ok()?,
+        pump4_k:    cols[14].parse().ok()?,
     })
 }
 
@@ -1564,6 +1564,12 @@ pub fn phase5_running(csv_path: &str, out3_entry: f64, out4_entry: f64, log: &mu
                 "[GL7]   Total run time: {:.1} hours.",
                 elapsed.as_secs_f64() / 3600.0
             ));
+            // Close both heat switches so no LS350 output remains powered once
+            // the run is over: Output 3 (4-switch) and Output 4 (3-switch) → 0%.
+            // (Outputs 1 and 2 were already set to 0% in Phases 3 and 4.)
+            log.phase("[GL7]   Closing heat switches — Output 3 and Output 4 → 0%.");
+            set_output_pct(&mut ls350, 3, 0.0)?;
+            set_output_pct(&mut ls350, 4, 0.0)?;
             log.phase("[GL7]   ⁴He exhausted — GL7 run complete.");
             return Ok(());
         }
