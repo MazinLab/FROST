@@ -1,7 +1,7 @@
 // gui.rs — Minimal GUI shell for FROST (header + theme options only)
 
 use eframe::egui;
-use crate::worker::{DeviceSnapshot, GuiCommand, SerialWorker};
+use crate::worker::{DeviceSnapshot, GuiCommand, SerialWorker, POLL_INTERVAL};
 use std::time::{Duration, Instant};
 
 /// Launch the graphical user interface.
@@ -26,6 +26,21 @@ pub fn run() -> eframe::Result<()> {
 
 fn apply_fonts(ctx: &egui::Context) {
     ctx.set_fonts(egui::FontDefinitions::default());
+}
+
+/// Render a raw magnet reading string with its unit, or an em-dash if there is
+/// no reading. Both no-data representations that can reach the snapshot — an
+/// empty string (from `poll_magnet`, which uses `unwrap_or_default()` on a
+/// failed read) and `"NO_RESPONSE"` (from the ADR readout state file written by
+/// the ramp subprocess) — collapse to the same `—`, so a dead LS625 read looks
+/// identical whether or not a ramp is in progress.
+pub fn magnet_reading_display(raw: &str, unit: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "NO_RESPONSE" {
+        "—".to_string()
+    } else {
+        format!("{raw} {unit}")
+    }
 }
 
 struct FrostApp {
@@ -128,6 +143,20 @@ impl FrostApp {
             self.last_synced_gl7 = snap.last_gl7_update;
         }
     }
+
+    /// Gate a start against the worker's cached snapshot (Option A). Returns
+    /// `Ok(())` if the process may start, or `Err(reason)` to display. When
+    /// safety is OFF this always returns `Ok(())`.
+    fn safety_gate(&self, snap: &DeviceSnapshot, context: &str) -> Result<(), String> {
+        crate::safety::guard_start_from_snapshot(
+            context,
+            snap.compressor_running,
+            snap.last_compressor_update.map(|t| t.elapsed()),
+            &snap.temperatures.ls350_d3,
+            snap.last_temp_update.map(|t| t.elapsed()),
+            std::time::Duration::from_secs(crate::safety::SNAPSHOT_MAX_AGE_SECS),
+        )
+    }
 }
 
 impl eframe::App for FrostApp {
@@ -188,6 +217,46 @@ impl eframe::App for FrostApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_space(8.0);
+
+                // ── Safety interlock toggle + override banner ─────────────
+                let safety_on = crate::safety::is_safety_enabled();
+                ui.horizontal(|ui| {
+                    let (label, fill) = if safety_on {
+                        ("Safety: ON", egui::Color32::from_rgb(30, 130, 60))
+                    } else {
+                        ("Safety: OFF", egui::Color32::from_rgb(185, 30, 30))
+                    };
+                    let btn = egui::Button::new(
+                        egui::RichText::new(label).strong().color(egui::Color32::WHITE),
+                    )
+                    .fill(fill);
+                    if ui.add(btn).clicked() {
+                        // Toggle and persist. A failure to re-enable leaves
+                        // interlocks bypassed, so log it as a safety event and
+                        // surface it in the compressor error slot.
+                        if let Err(e) = crate::safety::set_safety(!safety_on) {
+                            let msg = format!("Safety toggle to {} failed: {e}",
+                                if safety_on { "OFF" } else { "ON" });
+                            crate::safety::log_safety_event(&msg);
+                            self.compressor_error = Some(msg);
+                        }
+                    }
+                    ui.label(if safety_on {
+                        "Start interlocks active"
+                    } else {
+                        "Start interlocks bypassed"
+                    });
+                });
+                if !safety_on {
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("⚠ Safety OFF — start interlocks are bypassed")
+                            .strong()
+                            .size(16.0)
+                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                    );
+                }
+                ui.add_space(6.0);
 
                 // Header row: FROST title on the left, heatswitch toggle on the right.
                 ui.horizontal(|ui| {
@@ -293,19 +362,10 @@ impl FrostApp {
     fn show_status_bar(&self, ui: &mut egui::Ui, snap: &DeviceSnapshot) {
         let is_recording = snap.recording_active;
 
-        let outputs_on = snap.gl7_polled_pct.iter()
-            .any(|p| p.map(|v| v > 0.0).unwrap_or(false));
-        let head3_cold = snap.temperatures.ls350_a
-            .split_whitespace().next()
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(|k| k > 0.0 && k < 0.4)
-            .unwrap_or(false);
-        let gl7_active = outputs_on || head3_cold || snap.gl7_cooldown_active;
-
         let chips: &[(&str, bool)] = &[
             ("Compressor",  snap.compressor_running),
             ("ADR Ramp",    snap.adr_ramp_running),
-            ("GL7",         gl7_active),
+            ("GL7",         snap.gl7_cooldown_active),
             ("Recording",   is_recording),
             ("Heatswitch",  snap.heatswitch_is_open == Some(true)),
         ];
@@ -435,8 +495,9 @@ impl FrostApp {
             }
             if let Some(t) = snap.last_compressor_update {
                 ui.label(format!(
-                    "Last updated: {:.1}s ago  (refreshes every 30 s)",
-                    t.elapsed().as_secs_f32()
+                    "Last updated: {:.1}s ago  (refreshes every {} s)",
+                    t.elapsed().as_secs_f32(),
+                    POLL_INTERVAL.as_secs()
                 ));
             }
         } else {
@@ -570,30 +631,38 @@ impl FrostApp {
                 )
                 .fill(egui::Color32::from_rgb(140, 185, 255));
                 if ui.add(btn).clicked() {
-                    // Spawn frost adr ramp as a detached subprocess so it survives GUI restarts.
-                    match std::env::current_exe()
-                        .map_err(|e| e.to_string())
-                        .and_then(|exe| {
-                            std::process::Command::new(&exe)
-                                .args([
-                                    "adr", "ramp",
-                                    &self.adr_ramp_rate.to_string(),
-                                    &self.adr_ramp_current.to_string(),
-                                    "--soak-mins",
-                                    &self.adr_ramp_soak_mins.to_string(),
-                                ])
-                                .spawn()
-                                .map_err(|e| e.to_string())
-                        })
-                    {
-                        Ok(child) => {
-                            self.adr_ramp_pid   = Some(child.id());
-                            self.adr_ramp_child = Some(child);
-                            self.adr_ramp_result = None;
-                            self.worker.send(GuiCommand::RunAdrRamp);
-                        }
-                        Err(e) => {
-                            self.adr_ramp_result = Some(Err(format!("Failed to start ramp process: {e}")));
+                    // Gate against the cached snapshot before spawning. The
+                    // subprocess is told (via env var) the check is already done,
+                    // so it won't re-read serial and race the worker's poll.
+                    if let Err(reason) = self.safety_gate(&snap, "ADR ramp") {
+                        self.adr_ramp_result = Some(Err(reason));
+                    } else {
+                        // Spawn frost adr ramp as a detached subprocess so it survives GUI restarts.
+                        match std::env::current_exe()
+                            .map_err(|e| e.to_string())
+                            .and_then(|exe| {
+                                std::process::Command::new(&exe)
+                                    .args([
+                                        "adr", "ramp",
+                                        &self.adr_ramp_rate.to_string(),
+                                        &self.adr_ramp_current.to_string(),
+                                        "--soak-mins",
+                                        &self.adr_ramp_soak_mins.to_string(),
+                                    ])
+                                    .env(crate::safety::GUI_CHECKED_ENV, "1")
+                                    .spawn()
+                                    .map_err(|e| e.to_string())
+                            })
+                        {
+                            Ok(child) => {
+                                self.adr_ramp_pid   = Some(child.id());
+                                self.adr_ramp_child = Some(child);
+                                self.adr_ramp_result = None;
+                                self.worker.send(GuiCommand::RunAdrRamp);
+                            }
+                            Err(e) => {
+                                self.adr_ramp_result = Some(Err(format!("Failed to start ramp process: {e}")));
+                            }
                         }
                     }
                 }
@@ -613,21 +682,9 @@ impl FrostApp {
 
         // ── Live readback cards ──────────────────────────────────
         {
-            let current_str = if snap.magnet_current.is_empty() {
-                "—".to_string()
-            } else {
-                format!("{} A", snap.magnet_current)
-            };
-            let voltage_str = if snap.magnet_voltage.is_empty() {
-                "—".to_string()
-            } else {
-                format!("{} V", snap.magnet_voltage)
-            };
-            let field_str = if snap.magnet_field.is_empty() {
-                "—".to_string()
-            } else {
-                format!("{} T", snap.magnet_field)
-            };
+            let current_str = magnet_reading_display(&snap.magnet_current, "A");
+            let voltage_str = magnet_reading_display(&snap.magnet_voltage, "V");
+            let field_str   = magnet_reading_display(&snap.magnet_field, "T");
 
             let cards: &[(&str, &str)] = &[
                 ("Output Current", &current_str),
@@ -832,8 +889,12 @@ impl FrostApp {
             self.worker.send(GuiCommand::Gl7CooldownActive(false));
         }
 
-        // Running if child is alive in this session OR lock file says so (after reload / CLI).
-        let gl7_running = self.gl7_cooldown_child.is_some() || snap.gl7_cooldown_active;
+        // Single source of truth, shared with the top-bar chip: the worker keeps
+        // snap.gl7_cooldown_active synced from live outputs + the lock file each
+        // loop, so this survives a GUI restart and can never disagree with the
+        // chip. The in-memory child/PID handles below are used ONLY to kill the
+        // subprocess, never to decide the label (mirrors the ADR ramp section).
+        let gl7_running = snap.gl7_cooldown_active;
 
         // When running externally (CLI or previous session), keep the stored PID
         // fresh so the stop button can kill the right process.
@@ -881,11 +942,16 @@ impl FrostApp {
                     let path = self.gl7_cooldown_csv_path.trim().to_string();
                     if path.is_empty() {
                         self.gl7_cooldown_result = Some(Err("No CSV path specified.".to_string()));
+                    } else if let Err(reason) = self.safety_gate(&snap, "GL7 cooldown") {
+                        // Gate against the cached snapshot before spawning; the
+                        // subprocess is told the check is done (env var).
+                        self.gl7_cooldown_result = Some(Err(reason));
                     } else {
                         let exe = std::env::current_exe()
                             .unwrap_or_else(|_| std::path::PathBuf::from("frost"));
                         match std::process::Command::new(&exe)
                             .args(["gl7", "cooldown", "--csv", &path])
+                            .env(crate::safety::GUI_CHECKED_ENV, "1")
                             .spawn()
                         {
                             Ok(child) => {
@@ -992,8 +1058,9 @@ impl FrostApp {
         ui.add_space(4.0);
         if let Some(t) = snap.last_gl7_update {
             ui.label(format!(
-                "Last updated: {:.1}s ago  (refreshes every 30 s)",
-                t.elapsed().as_secs_f32()
+                "Last updated: {:.1}s ago  (refreshes every {} s)",
+                t.elapsed().as_secs_f32(),
+                POLL_INTERVAL.as_secs()
             ));
         } else {
             ui.label("(pending first poll…)");
@@ -1028,7 +1095,7 @@ impl FrostApp {
                 .fill(egui::Color32::from_rgb(140, 185, 255));
                 if ui.add(btn).clicked() {
                     self.worker.send(GuiCommand::StartRecording {
-                        interval_secs: 30,
+                        interval_secs: POLL_INTERVAL.as_secs(),
                         output_dir: "temps".to_string(),
                         resume_path: None,
                     });
@@ -1046,14 +1113,12 @@ impl FrostApp {
         ui.add_space(6.0);
 
         let t   = &snap.temperatures;
-        let adr_temp = t.ls350_b.split('\u{2192}').nth(1)
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| t.ls350_b.clone());
         let elapsed = snap.last_temp_update.map(|t| t.elapsed().as_secs_f32());
 
+        // Input B (ADR) is intentionally not displayed — that port is currently
+        // empty. It is still polled/logged everywhere else (worker, record-temps).
         let sensors: &[(&str, &str)] = &[
             ("4K Stage",     &t.ls350_d3),
-            ("ADR",          &adr_temp),
             ("4-Switch",     &t.ls350_d2),
             ("3-Head",       &t.ls350_a),
             ("4-Head",       &t.ls350_c),
@@ -1091,6 +1156,6 @@ impl FrostApp {
         } else {
             ui.label("(pending first poll…)");
         }
-        ui.label("Updates every 30 seconds");
+        ui.label(format!("Updates every {} seconds", POLL_INTERVAL.as_secs()));
     }
 }

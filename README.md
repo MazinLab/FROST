@@ -95,7 +95,13 @@ The GUI runs a background worker thread that polls all devices every 30 seconds 
 
 ### Layout
 
-The GUI is divided into five sections displayed top-to-bottom. A fixed status bar sits above the scrollable content and is always visible.
+The GUI is divided into five sections displayed top-to-bottom. A fixed status bar sits above the scrollable content and is always visible, and a safety toggle sits at the top of the scrollable area.
+
+**Safety Toggle**
+- **Safety: ON / OFF** button at the top of the window — green when interlocks are active, red when bypassed
+- Clicking it flips and persists the state (shared with the CLI, survives restarts)
+- While OFF, a red **"⚠ Safety OFF — start interlocks are bypassed"** banner is shown
+- See [Safety Interlocks](#safety-interlocks) for what the interlocks gate
 
 **Status Bar**
 - Always-visible strip at the very top showing a one-line system summary
@@ -306,6 +312,16 @@ frost record-temps loop --interval 60
 
 Logs are written to `temps/YYYY-MM-DD_temperature_log.csv`. If a file already exists for the current date, subsequent runs write to `_2.csv`, `_3.csv`, etc. The CSV format is 19 fixed-width space-padded columns covering all LS350 inputs and LS370 input 1.
 
+### `frost safety` — Start-Safety Interlocks
+
+```bash
+frost safety status   # Print whether safety is ON or OFF
+frost safety off      # Bypass start interlocks (persists across restarts)
+frost safety on       # Re-enable start interlocks
+```
+
+Controls the interlocks that gate ADR/GL7/manual-output starts. See [Safety Interlocks](#safety-interlocks) for the full behavior.
+
 ---
 
 ## GL7 Sorption Cooler Cooldown
@@ -432,6 +448,51 @@ frost gl7 cycle-4he  --csv temps/...
 frost gl7 cycle-3he  --csv temps/...
 frost gl7 running    --csv temps/...
 ```
+
+---
+
+## Safety Interlocks
+
+FROST enforces start-safety interlocks before any potentially-dangerous operation is **started**. Two preconditions must both hold:
+
+1. The **compressor is running**.
+2. The **4K stage** (LS350 input D3) is **below 4.2 K** (a reading ≥ 4.2 K blocks).
+
+### What is gated
+
+| Operation | CLI | GUI |
+|-----------|-----|-----|
+| ADR ramp | `frost adr ramp …` | **Start ADR Cooldown** button |
+| GL7 full cooldown | `frost gl7 cooldown …` | **Start GL7 Cooldown** button |
+| GL7 cold-start ramp (Phase 1) | `frost gl7 ramp-pumps …` | — |
+| Manual LS350 output ON | `frost lakeshore350 set-output <N> <pct>` (pct > 0), `outputs-set-range <N> <range>` (range ≠ 0) | GL7 output **Set** buttons (percentage > 0) |
+
+**Not gated:** read-only queries; turning an output **off** (0% / range 0); `frost adr logging`; and the mid-sequence GL7 phases (`stabilize`, `cycle-4he`, `cycle-3he`, `running`), which resume an already-started cooldown where the 4K stage is expected to be above 4.2 K.
+
+### Key behaviors
+
+- **Start-only.** The interlock is checked **once**, at the moment a process starts. It is never re-evaluated during a run — if the 4K stage rises above 4.2 K while an ADR ramp or GL7 cooldown is in progress, the process is **not** stopped.
+- **Fail-safe.** If a required reading cannot be obtained (serial error, sensor overrange, wrong port), the start is **blocked**, not allowed.
+- **Persistent override.** Safety defaults to **ON** and can be toggled OFF to bypass the interlocks. The state is stored in `$HOME/.frost/safety_disabled` (present = OFF), shared between the CLI and GUI, and survives restarts and sessions. If `$HOME` is unavailable it falls back to `state/.safety_disabled`.
+- **Failure audit log.** Every blocked start (and any failed safety toggle) is announced on stderr and appended with a timestamp to `logs/safety_log.txt`. Only failures are logged — never passes.
+
+### CLI
+
+```bash
+frost safety status   # Print whether safety is ON or OFF
+frost safety off      # Bypass interlocks (persists across restarts)
+frost safety on       # Re-enable interlocks
+```
+
+If a blocked start occurs, the command exits with an error naming the failed condition(s), e.g.:
+
+```
+Error: ADR ramp blocked by safety interlock: compressor is not running. To override, run `frost safety off` or toggle the GUI Safety button.
+```
+
+### GUI
+
+A **Safety: ON / OFF** toggle button sits at the top of the window — green when ON, red when OFF. Clicking it flips and persists the state. While safety is OFF, a red **"⚠ Safety OFF — start interlocks are bypassed"** banner is shown. A blocked start reports its reason in the relevant section's status line instead of launching.
 
 ---
 

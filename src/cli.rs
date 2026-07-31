@@ -104,6 +104,23 @@ pub enum Device {
         #[command(subcommand)]
         command: Gl7Cmd,
     },
+
+    /// Enable/disable the start-safety interlocks (persists across restarts)
+    Safety {
+        #[command(subcommand)]
+        command: SafetyCmd,
+    },
+}
+
+// ── Safety subcommands ────────────────────────────────────────
+#[derive(Subcommand)]
+pub enum SafetyCmd {
+    /// Turn safety ON — start interlocks active (the default state).
+    On,
+    /// Turn safety OFF — bypass start interlocks until turned back on.
+    Off,
+    /// Print whether safety is currently ON or OFF.
+    Status,
 }
 
 // ── GL7 subcommands ───────────────────────────────────────────
@@ -497,6 +514,11 @@ fn adr_ramp_subprocess(rate: f64, current: f64, soak_mins: u64) -> Result<(), St
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
 
+    // Gate the start before creating any lock/log files so a blocked ramp
+    // leaves no stale state behind. (GUI-spawned subprocesses set
+    // FROST_SAFETY_GUI_CHECKED and this returns Ok immediately.)
+    crate::safety::guard_start("ADR ramp")?;
+
     let _ = std::fs::create_dir_all("state");
     set_adr_ramp_persisted(std::process::id());
     let _ = std::fs::write(ADR_RAMP_LOG_PATH, "");
@@ -547,6 +569,7 @@ fn adr_ramp_subprocess(rate: f64, current: f64, soak_mins: u64) -> Result<(), St
     drop(log_tx); // flush the log writer thread
 
     clear_adr_ramp_persisted();
+    crate::worker::clear_adr_magnet_readout();
     let _ = std::fs::remove_file(ADR_RAMP_STOP_PATH);
 
     result
@@ -594,12 +617,36 @@ pub fn run() -> Result<(), String> {
         Device::RecordTemps { command } => {
             run_record_temps(command)
         }
+        Device::Safety { command } => {
+            match command {
+                SafetyCmd::On => {
+                    // Failing to re-enable is fail-DANGEROUS: the override file
+                    // would remain and interlocks stay bypassed. Make it loud
+                    // and logged, and fail the command so it can't look OK.
+                    if let Err(e) = crate::safety::set_safety(true) {
+                        let msg = format!(
+                            "FAILED to enable safety: {e} — SAFETY REMAINS OFF (interlocks still bypassed)"
+                        );
+                        crate::safety::log_safety_event(&msg);
+                        eprintln!("[SAFETY] {msg}");
+                        eprintln!("[SAFETY] {}", crate::safety::safety_status_string());
+                        return Err(msg);
+                    }
+                }
+                SafetyCmd::Off => crate::safety::set_safety(false)?,
+                SafetyCmd::Status => {}
+            }
+            println!("{}", crate::safety::safety_status_string());
+            Ok(())
+        }
         Device::Gl7 { command } => match command {
             Gl7Cmd::Check { csv } => {
                 let mut log = gl7_automation::Gl7Logger::new(&csv)?;
                 gl7_automation::phase0_check(&csv, &mut log)
             }
             Gl7Cmd::RampPumps { csv } => {
+                // GL7 cold-start entry point — gate on compressor + 4K stage.
+                crate::safety::guard_start("GL7 ramp-pumps")?;
                 let mut log = gl7_automation::Gl7Logger::new(&csv)?;
                 gl7_automation::phase1_ramp_pumps(&csv, &mut log).map(|_| ())
             }
@@ -619,7 +666,11 @@ pub fn run() -> Result<(), String> {
                 let mut log = gl7_automation::Gl7Logger::new(&csv)?;
                 gl7_automation::phase5_running(&csv, out3, out4, &mut log)
             }
-            Gl7Cmd::Cooldown { csv } => gl7_automation::run_cooldown(&csv),
+            Gl7Cmd::Cooldown { csv } => {
+                // Full automation start — gate on compressor + 4K stage.
+                crate::safety::guard_start("GL7 cooldown")?;
+                gl7_automation::run_cooldown(&csv)
+            }
         },
         Device::Adr { command } => match command {
             AdrCmd::Ramp { rate, current, soak_mins } => {
@@ -1011,6 +1062,12 @@ fn run_lakeshore350(ctrl: &mut LakeShore350Controller, cmd: Lakeshore350Cmd) -> 
             Ok(())
         }
         Lakeshore350Cmd::SetOutput { output, percent } => {
+            // Energizing a GL7 output is a "start" — gate ON-writes only.
+            // Setting an output to 0% (turning it off) is always allowed.
+            // Check the same LS350 port this command is driving.
+            if percent > 0.0 {
+                crate::safety::guard_start_ls350("LS350 output", ctrl.port.clone(), ctrl.baud_rate)?;
+            }
             ctrl.set_output_percent(output, percent);
             print_ctrl(&ctrl.output, &ctrl.error_message)
         }
@@ -1027,6 +1084,15 @@ fn run_lakeshore350(ctrl: &mut LakeShore350Controller, cmd: Lakeshore350Cmd) -> 
             print_ctrl(&ctrl.output, &ctrl.error_message)
         }
         Lakeshore350Cmd::OutputsSetRange { output, range } => {
+            // Enabling a heater range (nonzero) energizes the output — gate it.
+            // Range 0 (Off) is always allowed.
+            if range != 0 {
+                crate::safety::guard_start_ls350(
+                    "LS350 output range",
+                    ctrl.port.clone(),
+                    ctrl.baud_rate,
+                )?;
+            }
             ctrl.set_output_range(output, range);
             print_ctrl(&ctrl.output, &ctrl.error_message)
         }

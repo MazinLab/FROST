@@ -121,6 +121,19 @@ pub fn clear_gl7_cooldown_persisted() {
     let _ = fs::remove_file(GL7_COOLDOWN_RUNNING_PATH);
 }
 
+/// Single source of truth for "GL7 is active", read by BOTH the top-bar chip
+/// and the section button so the two can never disagree (mirrors how the
+/// compressor and ADR ramp share one snapshot bool). The GL7 is considered
+/// active if any output is energized (`gl7_polled_pct` polled from the LS350)
+/// OR a cooldown control subprocess is alive (`lock_alive`). Phase 5 of a
+/// running GL7 holds the switch heaters (outputs 3 & 4) on, so a live run
+/// always satisfies the outputs term; stopping zeroes the outputs, which
+/// clears this on the next poll.
+pub fn gl7_active(gl7_polled_pct: &[Option<f64>], lock_alive: bool) -> bool {
+    let outputs_on = gl7_polled_pct.iter().any(|p| p.map(|v| v > 0.0).unwrap_or(false));
+    outputs_on || lock_alive
+}
+
 /// GL7 output-percentage state file written by the cooldown subprocess so the
 /// worker can display live percentages without polling the LS350 port directly.
 /// Format: four space-separated f64 values representing outputs 1–4.
@@ -146,6 +159,38 @@ pub fn read_gl7_output_state() -> Option<[f64; 4]> {
 
 pub fn clear_gl7_output_state() {
     let _ = fs::remove_file(GL7_OUTPUTS_PATH);
+}
+
+/// Live LS625 readout state file written by the ADR ramp subprocess so the GUI
+/// worker can show current/voltage/field WITHOUT opening the LS625 port — which
+/// the ramp subprocess owns during a run. Three newline-separated strings
+/// (current, voltage, field), each a formatted value or "NO_RESPONSE".
+pub const ADR_MAGNET_READOUT_PATH: &str = "state/.adr_magnet_readout";
+
+pub fn write_adr_magnet_readout_at(path: &Path, current: &str, voltage: &str, field: &str) {
+    ensure_parent(path);
+    let _ = fs::write(path, format!("{current}\n{voltage}\n{field}\n"));
+}
+
+pub fn write_adr_magnet_readout(current: &str, voltage: &str, field: &str) {
+    write_adr_magnet_readout_at(Path::new(ADR_MAGNET_READOUT_PATH), current, voltage, field);
+}
+
+pub fn read_adr_magnet_readout_at(path: &Path) -> Option<(String, String, String)> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let current = lines.next()?.to_string();
+    let voltage = lines.next()?.to_string();
+    let field   = lines.next()?.to_string();
+    Some((current, voltage, field))
+}
+
+pub fn read_adr_magnet_readout() -> Option<(String, String, String)> {
+    read_adr_magnet_readout_at(Path::new(ADR_MAGNET_READOUT_PATH))
+}
+
+pub fn clear_adr_magnet_readout() {
+    let _ = fs::remove_file(ADR_MAGNET_READOUT_PATH);
 }
 
 /// Write "open" or "closed" to the heatswitch state file.
@@ -382,7 +427,7 @@ impl SerialWorker {
         if was_recording {
             let resume_path = crate::record_temps::get_recording_active_path();
             worker.send(GuiCommand::StartRecording {
-                interval_secs: 30,
+                interval_secs: POLL_INTERVAL.as_secs(),
                 output_dir: "temps".to_string(),
                 resume_path,
             });
@@ -399,7 +444,10 @@ impl SerialWorker {
 
 // ── Worker loop ────────────────────────────────────────────────
 
-const POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the worker polls each device. The GUI derives its "refreshes every
+/// N s" labels and the recording command's interval from this single constant,
+/// so changing the cadence here keeps the on-screen text truthful.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 struct WorkerState {
     compressor: CryomechController,
@@ -448,13 +496,16 @@ fn worker_loop(
             ctx.request_repaint();
         }
 
-        // Sync GL7 cooldown state from the lock file so that cooldowns started
-        // from the CLI are reflected in the GUI without a restart.
+        // Recompute the single "GL7 active" flag every loop from live-polled
+        // outputs plus the cooldown lock file, so both the top-bar chip and the
+        // section button (which read only this flag) stay correct across a GUI
+        // restart and reflect cooldowns started from the CLI.
         {
             let lock_active = get_gl7_cooldown_pid().is_some();
             let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
-            if s.gl7_cooldown_active != lock_active {
-                s.gl7_cooldown_active = lock_active;
+            let active = gl7_active(&s.gl7_polled_pct, lock_active);
+            if s.gl7_cooldown_active != active {
+                s.gl7_cooldown_active = active;
                 drop(s);
                 ctx.request_repaint();
             }
@@ -484,7 +535,24 @@ fn worker_loop(
         }
 
         if state.last_magnet_poll.elapsed() >= POLL_INTERVAL {
-            poll_magnet(&mut state, &snap);
+            // If an ADR ramp subprocess is live it owns the LS625 port
+            // exclusively — polling here would clash on the exclusive lock and
+            // could abort the ramp (including the demag set_current(0)). Skip
+            // the hardware poll and instead read the current/voltage/field the
+            // subprocess writes to its readout state file, so the GUI stays live.
+            // get_adr_ramp_pid() liveness-checks the PID, so this self-heals if
+            // the subprocess dies.
+            if get_adr_ramp_pid().is_some() {
+                if let Some((current, voltage, field)) = read_adr_magnet_readout() {
+                    let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                    s.magnet_current = current;
+                    s.magnet_voltage = voltage;
+                    s.magnet_field   = field;
+                    s.last_magnet_update = Some(Instant::now());
+                }
+            } else {
+                poll_magnet(&mut state, &snap);
+            }
             state.last_magnet_poll = Instant::now();
             ctx.request_repaint();
         }
@@ -494,7 +562,15 @@ fn worker_loop(
             // hardware polling to avoid exclusive-lock errors.  Instead, read
             // the output-percentage state file the subprocess maintains so the
             // GUI still shows live values during a cooldown.
-            let cooldown_active = snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_cooldown_active;
+            //
+            // Gate on the LIVE lock file (PID check), NOT the derived
+            // `gl7_cooldown_active` display flag. That flag also latches true on
+            // stale non-zero `gl7_polled_pct` (e.g. Phase 5 leaves the switch
+            // heaters on); routing on it would skip the hardware poll forever
+            // after the subprocess exits, so the stale percentages — the very
+            // thing keeping the flag set — could never be refreshed to zero.
+            // Mirrors the magnet path, which gates on get_adr_ramp_pid().
+            let cooldown_active = get_gl7_cooldown_pid().is_some();
             if cooldown_active {
                 if let Some(pcts) = read_gl7_output_state() {
                     let mut s = snap.lock().unwrap_or_else(|p| p.into_inner());
@@ -517,7 +593,9 @@ fn worker_loop(
             // - Recording active: recording callback writes fresh temps instead.
             // - GL7 cooldown active: subprocess writes LS350 outputs; concurrent
             //   reads from this thread will clash on the exclusive port lock.
-            let cooldown_active = snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_cooldown_active;
+            // Gate on the live lock file (PID check), not the latching display
+            // flag — see the GL7 poll block above for why.
+            let cooldown_active = get_gl7_cooldown_pid().is_some();
             if state.recording_stop_flag.is_none() && !cooldown_active {
                 poll_temps(&mut state, &snap);
                 ctx.request_repaint();
@@ -554,6 +632,35 @@ fn execute_command(cmd: GuiCommand, state: &mut WorkerState, snap: &Arc<Mutex<De
                 return;
             }
             let idx = (output as usize) - 1;
+
+            // Energizing an output is a "start" — gate ON-writes against the
+            // worker's cached snapshot (Option A: no fresh serial read, no race
+            // with the worker's own poll). Turning an output OFF (0%) is always
+            // allowed. A blocked write surfaces via gl7_set_results.
+            if pct > 0.0 {
+                let (running, comp_age, d3, temp_age) = {
+                    let s = snap.lock().unwrap_or_else(|p| p.into_inner());
+                    (
+                        s.compressor_running,
+                        s.last_compressor_update.map(|t| t.elapsed()),
+                        s.temperatures.ls350_d3.clone(),
+                        s.last_temp_update.map(|t| t.elapsed()),
+                    )
+                };
+                if let Err(reason) = crate::safety::guard_start_from_snapshot(
+                    &format!("GL7 Output {output}"),
+                    running,
+                    comp_age,
+                    &d3,
+                    temp_age,
+                    Duration::from_secs(crate::safety::SNAPSHOT_MAX_AGE_SECS),
+                ) {
+                    snap.lock().unwrap_or_else(|p| p.into_inner()).gl7_set_results[idx] =
+                        Some(Err(reason));
+                    return;
+                }
+            }
+
             // Retry indefinitely on "Device or resource busy" — the GL7 subprocess
             // may still hold the port fd immediately after being killed.  Any other
             // error (write failure, bad port, etc.) breaks out immediately.
@@ -746,7 +853,11 @@ fn poll_adr_ramp(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>, ctx
 
 // ── Recording helpers ──────────────────────────────────────────
 
-fn format_opt_kelvin(v: Option<f64>) -> String {
+/// Canonical Kelvin-reading formatter, shared by every temperature display path.
+/// `Some(k>0)` → `"{k:.4} K"`; `Some(k<=0)` → `"T_OVER"` (overload); `None` → `"---"`
+/// (no reading). All callers route through this so the same physical condition
+/// renders identically regardless of which path produced it.
+pub fn format_opt_kelvin(v: Option<f64>) -> String {
     match v {
         Some(k) if k > 0.0 => format!("{k:.4} K"),
         Some(_)             => "T_OVER".to_string(),
@@ -779,11 +890,15 @@ fn poll_compressor(state: &mut WorkerState, snap: &Arc<Mutex<DeviceSnapshot>>) {
         // good state so a transient comms glitch doesn't lose the user's intent.
     } else {
         s.compressor_status  = state.compressor.status_output.clone();
-        s.compressor_running = state.compressor.status_output
-            .lines()
-            .any(|l| l.contains("Running:") && l.contains("Yes"));
-        // Persist so the GUI button shows the right label immediately on restart.
-        set_compressor_intent(s.compressor_running);
+        // Read the canonical bool that get_status() parsed from the same comp_on()
+        // query — never re-scrape the formatted status text. If the running bit
+        // itself errored (running == None), preserve the last known value rather
+        // than flipping the button to "off" on a partial poll.
+        if let Some(running) = state.compressor.running {
+            s.compressor_running = running;
+            // Persist so the GUI button shows the right label immediately on restart.
+            set_compressor_intent(running);
+        }
     }
     s.last_compressor_update = Some(Instant::now());
 }
@@ -936,12 +1051,12 @@ pub fn extract_temperature_value(temp_str: &str) -> String {
 }
 
 /// Format a raw KRDG? response (e.g. "+1.2345") to "1.2345 K".
+/// Delegates to [`format_opt_kelvin`] so overload (`T_OVER`) and no-data (`---`)
+/// render identically whether the reading arrives as a raw string (live polling)
+/// or as an `Option<f64>` (recording callback). An unparseable response is
+/// treated as "no reading" (`---`), the same as a `None`.
 pub fn format_kelvin_value(k_str: &str) -> String {
-    match k_str.parse::<f64>() {
-        Ok(k) if k > 0.0 => format!("{k:.4} K"),
-        Ok(_)            => format!("{k_str} (overload)"),
-        Err(_)           => k_str.to_string(),
-    }
+    format_opt_kelvin(k_str.parse::<f64>().ok())
 }
 
 /// Extract the third whitespace-delimited token as f64.

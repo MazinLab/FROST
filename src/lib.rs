@@ -15,4 +15,5 @@ pub mod lakeshore370;
 pub mod record_temps;
 pub mod adr_ramping;
 pub mod gl7_automation;
+pub mod safety;
 pub mod worker;

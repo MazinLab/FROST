@@ -336,7 +336,28 @@ impl Default for LakeShore350Controller {
     }
 }
 
+/// Shared overrange/garbage detector for raw LS350 responses, so the SRDG?
+/// (resistance) and KRDG? (temperature) paths can never drift apart on what
+/// counts as a bad frame. `prefix` is the instrument's reading-type letter used
+/// in its overrange tokens: `'R'` for resistance, `'T'` for temperature. Returns
+/// true when the response looks like an overrange or garbage frame rather than a
+/// trustworthy numeric value.
+pub fn looks_overrange(r: &str, prefix: char) -> bool {
+    if r.len() > 15 || r.contains('`') || r.contains('\x00') {
+        return true;
+    }
+    let up = r.to_uppercase();
+    up.contains("OVER") || up.contains(&format!("{prefix}.")) || up.contains(&format!("{prefix}_"))
+}
+
 impl LakeShore350Controller {
+    /// Construct a controller bound to a specific port/baud, with default (unloaded)
+    /// calibration state. Used by callers outside this module (e.g. the safety
+    /// interlock) that need a reader on a caller-chosen port.
+    pub fn with_port(port: String, baud_rate: u32) -> Self {
+        Self { port, baud_rate, ..Default::default() }
+    }
+
     /// Validate output number (1–4).
     fn validate_output(output_num: u8) -> Result<(), String> {
         if ALL_OUTPUTS.contains(&output_num) {
@@ -443,12 +464,7 @@ impl LakeShore350Controller {
         if r.is_empty() {
             return Ok("NO_RESPONSE".to_string());
         }
-        // Overrange indicators (mirrors Python length / garbage-char check)
-        if r.len() > 15 || r.contains('`') || r.contains('\x00') {
-            return Ok("R_OVER".to_string());
-        }
-        let up = r.to_uppercase();
-        if up.contains("OVER") || up.contains("R.") || up.contains("R_") {
+        if looks_overrange(&r, 'R') {
             return Ok("R_OVER".to_string());
         }
         Ok(r)
@@ -470,11 +486,7 @@ impl LakeShore350Controller {
         if r.is_empty() {
             return Ok("NO_RESPONSE".to_string());
         }
-        if r.len() > 15 || r.contains('`') || r.contains('\x00') {
-            return Ok("T_OVER".to_string());
-        }
-        let up = r.to_uppercase();
-        if up.contains("OVER") || up.contains("T.") || up.contains("T_") {
+        if looks_overrange(&r, 'T') {
             return Ok("T_OVER".to_string());
         }
         // Zero on D-type inputs indicates overrange (mirrors Python)
@@ -485,6 +497,18 @@ impl LakeShore350Controller {
             }
         }
         Ok(r)
+    }
+
+    /// Read `input` in Kelvin, returning the numeric value only when the reading
+    /// is trustworthy. Any overrange, no-response, or comms error yields `None`.
+    /// This is the single canonical "is there a valid Kelvin reading?" decision;
+    /// the safety interlock reuses it (via a default-constructed controller on the
+    /// relevant port) instead of re-implementing the overrange rules, so the two
+    /// can never disagree about whether a reading is valid.
+    pub fn read_kelvin_checked(&self, input: &str) -> Option<f64> {
+        // read_kelvin_raw maps every overrange/no-response case to a non-numeric
+        // sentinel ("T_OVER"/"NO_RESPONSE"), so parse failure == not trustworthy.
+        self.read_kelvin_raw(input).ok()?.parse::<f64>().ok()
     }
 
     /// Read A (3-head), B (ADR), C (4-head), D3 (4K stage), D4 (3-pump), and D5 (4-pump) and print sensor + Kelvin/calibrated for each.
