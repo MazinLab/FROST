@@ -9,16 +9,78 @@
 use std::sync::mpsc::channel;
 
 use frost::worker::{
-    DeviceSnapshot, GuiCommand,
-    extract_temperature_value, format_kelvin_value,
+    DeviceSnapshot, GuiCommand, POLL_INTERVAL,
+    extract_temperature_value, format_kelvin_value, format_opt_kelvin,
     parse_single_value, parse_limits_from_output,
+    write_adr_magnet_readout_at, read_adr_magnet_readout_at,
 };
+
+// ── Poll interval is a single source of truth (Finding 6) ────────────────────
+// The GUI derives its "refreshes every N s" labels and the recording interval
+// from POLL_INTERVAL. This guard asserts the exposed constant exists and is a
+// whole number of seconds so those derived labels read cleanly.
+
+#[test]
+fn poll_interval_is_exposed_and_whole_seconds() {
+    assert!(POLL_INTERVAL.as_secs() > 0, "poll interval must be positive");
+    assert_eq!(POLL_INTERVAL.subsec_nanos(), 0, "labels show whole seconds");
+}
+
+// ── ADR magnet readout state-file round-trip ─────────────────────────────────
+// The ADR ramp subprocess writes live LS625 current/voltage/field to this file
+// so the GUI worker can display them without opening the port during a ramp.
+
+#[test]
+fn adr_magnet_readout_roundtrips() {
+    let path = std::env::temp_dir()
+        .join("frost_adr_readout_test")
+        .join(".adr_magnet_readout");
+    let _ = std::fs::remove_file(&path);
+
+    write_adr_magnet_readout_at(&path, "9.4400", "1.2300", "0.5678");
+    let (c, v, f) = read_adr_magnet_readout_at(&path).expect("should read back");
+    assert_eq!(c, "9.4400");
+    assert_eq!(v, "1.2300");
+    assert_eq!(f, "0.5678");
+
+    let _ = std::fs::remove_file(&path);
+    if let Some(p) = path.parent() { let _ = std::fs::remove_dir(p); }
+}
+
+#[test]
+fn adr_magnet_readout_absent_is_none() {
+    let path = std::env::temp_dir()
+        .join("frost_adr_readout_absent_test")
+        .join(".adr_magnet_readout");
+    let _ = std::fs::remove_file(&path);
+    assert!(read_adr_magnet_readout_at(&path).is_none());
+}
+
+#[test]
+fn adr_magnet_readout_preserves_no_response_tokens() {
+    // A failed read is stored as "NO_RESPONSE"; it must round-trip intact so the
+    // GUI shows the fault rather than a bogus number.
+    let path = std::env::temp_dir()
+        .join("frost_adr_readout_noresp_test")
+        .join(".adr_magnet_readout");
+    let _ = std::fs::remove_file(&path);
+
+    write_adr_magnet_readout_at(&path, "9.4400", "NO_RESPONSE", "0.5678");
+    let (c, v, f) = read_adr_magnet_readout_at(&path).unwrap();
+    assert_eq!(c, "9.4400");
+    assert_eq!(v, "NO_RESPONSE");
+    assert_eq!(f, "0.5678");
+
+    let _ = std::fs::remove_file(&path);
+    if let Some(p) = path.parent() { let _ = std::fs::remove_dir(p); }
+}
 use frost::record_temps::{set_recording_active, clear_recording_active, is_recording_active, get_recording_active_path};
 use frost::worker::{
     get_gl7_cooldown_pid, set_gl7_cooldown_persisted, clear_gl7_cooldown_persisted,
     GL7_COOLDOWN_RUNNING_PATH,
     write_gl7_output_state, read_gl7_output_state, clear_gl7_output_state,
     GL7_OUTPUTS_PATH,
+    gl7_active,
 };
 
 // ── extract_temperature_value ─────────────────────────────────────────────────
@@ -49,7 +111,11 @@ fn extract_temp_bare_string_trimmed() {
     assert_eq!(extract_temperature_value("  raw garbage  "), "raw garbage");
 }
 
-// ── format_kelvin_value ───────────────────────────────────────────────────────
+// ── Kelvin formatting: single canonical representation ────────────────────────
+// format_kelvin_value (raw-string path, used by live polling) and
+// format_opt_kelvin (Option path, used by the recording callback) must render
+// the SAME physical condition with the SAME token, so a reading looks identical
+// on-screen regardless of which path produced it (Finding 1).
 
 #[test]
 fn format_kelvin_positive() {
@@ -57,19 +123,47 @@ fn format_kelvin_positive() {
 }
 
 #[test]
-fn format_kelvin_zero_shows_overload() {
-    // LS370 returns 0.0 on overload
-    assert_eq!(format_kelvin_value("+0.0000"), "+0.0000 (overload)");
+fn format_kelvin_zero_shows_canonical_overload() {
+    // LS370 returns 0.0 on overload → canonical "T_OVER" (not "(overload)").
+    assert_eq!(format_kelvin_value("+0.0000"), "T_OVER");
 }
 
 #[test]
-fn format_kelvin_negative_shows_overload() {
-    assert_eq!(format_kelvin_value("-1.0000"), "-1.0000 (overload)");
+fn format_kelvin_negative_shows_canonical_overload() {
+    assert_eq!(format_kelvin_value("-1.0000"), "T_OVER");
 }
 
 #[test]
-fn format_kelvin_unparseable_passthrough() {
-    assert_eq!(format_kelvin_value("???"), "???");
+fn format_kelvin_unparseable_is_no_data() {
+    // An unparseable response is treated as "no reading" → canonical "---".
+    assert_eq!(format_kelvin_value("???"), "---");
+}
+
+#[test]
+fn format_opt_kelvin_tokens() {
+    assert_eq!(format_opt_kelvin(Some(1.2345)), "1.2345 K");
+    assert_eq!(format_opt_kelvin(Some(0.0)),   "T_OVER");
+    assert_eq!(format_opt_kelvin(Some(-1.0)),  "T_OVER");
+    assert_eq!(format_opt_kelvin(None),        "---");
+}
+
+#[test]
+fn both_kelvin_paths_agree_on_same_condition() {
+    // The whole point of Finding 1: the raw-string and Option formatters must
+    // produce identical strings for the same underlying value.
+    for (raw, opt) in [
+        ("+1.2345", Some(1.2345_f64)),
+        ("+0.0000", Some(0.0)),
+        ("-1.0000", Some(-1.0)),
+    ] {
+        assert_eq!(
+            format_kelvin_value(raw),
+            format_opt_kelvin(opt),
+            "paths diverged for raw={raw:?}"
+        );
+    }
+    // No reading on either path → same no-data token.
+    assert_eq!(format_kelvin_value("???"), format_opt_kelvin(None));
 }
 
 // ── parse_single_value ────────────────────────────────────────────────────────
@@ -341,6 +435,85 @@ fn gl7_cooldown_missing_file_returns_none() {
     let _guard = GL7_PID_FILE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     clear_gl7_cooldown_persisted(); // ensure file is absent
     assert!(get_gl7_cooldown_pid().is_none(), "absent file must return None");
+}
+
+// ── gl7_active: single shared "GL7 active" flag ───────────────────────────────
+// This pure helper is the ONE source of truth read by both the top-bar chip and
+// the section button, so the two can never disagree. Active iff any output is
+// energized OR a cooldown subprocess is alive (lock file). No hardware touched.
+
+#[test]
+fn gl7_active_true_when_any_output_energized() {
+    // The reported scenario: cold GL7 with switch heaters (outputs 3 & 4) on,
+    // no live subprocess. Must read active so the section matches the chip.
+    let outputs = vec![None, None, Some(40.0), Some(38.0)];
+    assert!(gl7_active(&outputs, false), "outputs on must be active even with no lock");
+}
+
+#[test]
+fn gl7_active_true_when_lock_alive() {
+    // A just-started cooldown: lock file present before the first output poll.
+    let outputs = vec![None, None, None, None];
+    assert!(gl7_active(&outputs, true), "live cooldown subprocess must be active");
+}
+
+#[test]
+fn gl7_active_true_when_output_one_only() {
+    let outputs = vec![Some(25.0), Some(0.0), None, None];
+    assert!(gl7_active(&outputs, false), "a single energized output must be active");
+}
+
+#[test]
+fn gl7_active_false_when_all_outputs_zero_and_no_lock() {
+    // After Stop (outputs zeroed, lock cleared) the flag clears on the next poll.
+    let outputs = vec![Some(0.0), Some(0.0), Some(0.0), Some(0.0)];
+    assert!(!gl7_active(&outputs, false), "all-zero outputs with no lock must be inactive");
+}
+
+#[test]
+fn gl7_active_false_when_outputs_unpolled_and_no_lock() {
+    // Fresh start before any poll: all None, no lock → inactive.
+    let outputs = vec![None, None, None, None];
+    assert!(!gl7_active(&outputs, false), "unpolled outputs with no lock must be inactive");
+}
+
+// ── Regression: cooldown poll-routing must not latch on stale outputs ─────────
+//
+// The GL7 poll block skips the hardware poll (reading the state file instead)
+// ONLY while the cooldown subprocess owns the LS350 port. That decision must be
+// gated on live lock-file liveness (get_gl7_cooldown_pid), NOT on the derived
+// gl7_active display flag — which stays true on stale non-zero percentages left
+// behind when the subprocess exits (e.g. Phase 5 switch heaters). If routing
+// keyed on the display flag, the hardware poll would be skipped forever after
+// the subprocess exits, the stale percentages could never be refreshed to zero,
+// the flag could never clear, and "Last updated" would freeze permanently.
+//
+// This test reproduces the exact post-cooldown state: subprocess exited (lock +
+// output-state files removed) but percentages left energized. The routing
+// signal must report "not owned" so hardware polling resumes.
+#[test]
+fn gl7_poll_routing_uses_lock_liveness_not_stale_outputs() {
+    let _guard = GL7_PID_FILE_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+    // Subprocess exited: its Drop guard removed both files.
+    clear_gl7_cooldown_persisted();
+    clear_gl7_output_state();
+
+    // Stale energized percentages remain in the snapshot from the last read
+    // (Phase 5 holds the switch heaters on). The display flag stays true...
+    let stale = vec![None, None, Some(40.0), Some(38.0)];
+    assert!(gl7_active(&stale, false), "display chip correctly still reads active");
+
+    // ...but the port-ownership routing signal must be false, so the worker
+    // resumes hardware polling and refreshes the stale values instead of
+    // reading the (now-absent) state file forever.
+    assert!(
+        get_gl7_cooldown_pid().is_none(),
+        "no live subprocess → routing must fall through to the hardware poll"
+    );
+    assert!(
+        read_gl7_output_state().is_none(),
+        "state file is gone after exit — routing on the display flag would read None forever"
+    );
 }
 
 // ── GL7 output state file ─────────────────────────────────────────────────────

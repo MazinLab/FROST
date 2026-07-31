@@ -11,6 +11,7 @@ use frost::worker::{
     set_compressor_intent_at, is_compressor_intent_at,
     set_adr_ramp_persisted_at, clear_adr_ramp_persisted_at, is_adr_ramp_persisted_at,
 };
+use frost::gui::magnet_reading_display;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -264,4 +265,37 @@ fn compressor_intent_restart_cycle_restores_running_state() {
     assert!(intent_running, "compressor must appear running immediately on restart");
 
     cleanup(&path);
+}
+
+// ── Magnet reading display: unified no-data rendering (Finding 5) ─────────────
+// Both no-data representations that reach the snapshot — "" (poll_magnet's
+// unwrap_or_default on a failed read) and "NO_RESPONSE" (the ADR readout state
+// file during a ramp) — must render as the SAME em-dash, so a dead LS625 read
+// looks identical whether or not a ramp is in progress.
+
+#[test]
+fn magnet_display_shows_value_with_unit() {
+    assert_eq!(magnet_reading_display("9.4400", "A"), "9.4400 A");
+    assert_eq!(magnet_reading_display("0.5678", "T"), "0.5678 T");
+}
+
+#[test]
+fn magnet_display_empty_is_dash() {
+    assert_eq!(magnet_reading_display("", "A"), "—");
+    assert_eq!(magnet_reading_display("   ", "V"), "—");
+}
+
+#[test]
+fn magnet_display_no_response_is_dash() {
+    // The ramp-subprocess sentinel must not render as "NO_RESPONSE A".
+    assert_eq!(magnet_reading_display("NO_RESPONSE", "A"), "—");
+}
+
+#[test]
+fn magnet_display_no_data_paths_agree() {
+    // The whole point of Finding 5: empty and NO_RESPONSE collapse identically.
+    assert_eq!(
+        magnet_reading_display("", "A"),
+        magnet_reading_display("NO_RESPONSE", "A"),
+    );
 }

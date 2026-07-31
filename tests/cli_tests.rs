@@ -8,7 +8,7 @@
 use clap::Parser;
 use frost::cli::{
     AdrCmd, Cli, CompressorCmd, Device, Gl7Cmd, HeatswitchCmd, Lakeshore350Cmd, Lakeshore370Cmd,
-    Lakeshore625Cmd, RecordTempsCmd,
+    Lakeshore625Cmd, RecordTempsCmd, SafetyCmd,
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -746,4 +746,37 @@ fn gl7_running_parses_out3_and_out4_overrides() {
 #[test]
 fn gl7_running_missing_csv_fails() {
     parse_fails(&["frost", "gl7", "running"]);
+}
+
+// ── Safety command ─────────────────────────────────────────────────────────
+
+#[test]
+fn safety_on_parses() {
+    let cli = parse(&["frost", "safety", "on"]);
+    let Device::Safety { command } = cli.device else { panic!() };
+    assert!(matches!(command, SafetyCmd::On));
+}
+
+#[test]
+fn safety_off_parses() {
+    let cli = parse(&["frost", "safety", "off"]);
+    let Device::Safety { command } = cli.device else { panic!() };
+    assert!(matches!(command, SafetyCmd::Off));
+}
+
+#[test]
+fn safety_status_parses() {
+    let cli = parse(&["frost", "safety", "status"]);
+    let Device::Safety { command } = cli.device else { panic!() };
+    assert!(matches!(command, SafetyCmd::Status));
+}
+
+#[test]
+fn safety_requires_subcommand() {
+    parse_fails(&["frost", "safety"]);
+}
+
+#[test]
+fn safety_rejects_unknown_subcommand() {
+    parse_fails(&["frost", "safety", "maybe"]);
 }
