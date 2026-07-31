@@ -577,9 +577,9 @@ impl LakeShore350Controller {
         if self.three_head_cal.is_none() {
             // Try standard paths
             let paths = [
+                "/home/kids/FROST/src/gl7_calibrations/3_head_cal.csv",
                 "src/gl7_calibrations/3_head_cal.csv",
                 "gl7_calibrations/3_head_cal.csv",
-                "../gl7_calibrations/3_head_cal.csv",
             ];
             
             for path in &paths {
@@ -604,9 +604,9 @@ impl LakeShore350Controller {
         if self.four_head_cal.is_none() {
             // Try standard paths
             let paths = [
+                "/home/kids/FROST/src/gl7_calibrations/4_head_cal.csv",
                 "src/gl7_calibrations/4_head_cal.csv",
                 "gl7_calibrations/4_head_cal.csv",
-                "../gl7_calibrations/4_head_cal.csv",
             ];
             
             for path in &paths {
@@ -631,9 +631,9 @@ impl LakeShore350Controller {
         if self.pump_cal.is_none() {
             // Try standard paths
             let paths = [
+                "/home/kids/FROST/src/gl7_calibrations/pumps_switches_cal.csv",
                 "src/gl7_calibrations/pumps_switches_cal.csv",
                 "gl7_calibrations/pumps_switches_cal.csv",
-                "../gl7_calibrations/pumps_switches_cal.csv",
             ];
             
             for path in &paths {
