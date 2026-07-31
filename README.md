@@ -80,6 +80,15 @@ frost compressor --port /dev/ttyUSB0 --addr 17 status
 
 There are no config files — if you need permanent port reassignment, update the `DEFAULT_PORT` constants in the relevant `src/<device>.rs` file.
 
+### Busy-port retry behavior
+
+If a serial port is temporarily held by another process, FROST retries the open before failing:
+
+- **SCPI ports** (Lakeshore devices): up to 10 retries, 15 seconds apart (~2.5 minutes max)
+- **Zaber port** (heatswitch): up to 2 retries, 15 seconds apart (~30 seconds max)
+
+If retries are exhausted, the command fails with an error naming the port.
+
 ---
 
 ## GUI
@@ -107,7 +116,7 @@ The GUI is divided into five sections displayed top-to-bottom. A fixed status ba
 - Always-visible strip at the very top showing a one-line system summary
 - Four indicator chips: **Compressor**, **ADR Ramp**, **GL7**, **Recording**
 - Chip is green (active) or dark/muted (inactive)
-- GL7 is considered active if any heater/switch output is non-zero or the 3-Head temperature is below 400 mK
+- GL7 is considered active if any heater/switch output is non-zero or a cooldown subprocess is alive
 
 **Thermometry**
 - Live temperature readings from all LS350 inputs (4K Stage, ADR, 4-Switch, 3-Head, 4-Head, 3-Pump, 4-Pump) and LS370 input 1 (Device Stage)
@@ -125,6 +134,7 @@ The GUI is divided into five sections displayed top-to-bottom. A fixed status ba
 - **Start ADR Cooldown** launches the full automated ramp sequence; button turns red and shows elapsed time while the ramp is running
 - Live log output displayed in the GUI during the ramp
 - Ramp state persisted to `state/.adr_ramp_running` — detects interrupted ramps on restart
+- **Crash recovery:** if the GUI starts and finds a stale ramp lock file (subprocess died), it reads the LS625 current and automatically ramps to 0 A if the magnet is still energized above 0.5 A
 
 **GL7 Sorption Cooler**
 - **Start GL7 Cooldown** launches the full automated GL7 cooldown sequence (`frost gl7 cooldown`) as a subprocess; button turns red and reads "GL7 Cooldown In-Progress" until the process exits
@@ -220,9 +230,9 @@ frost lakeshore625 set-compliance <V> # Set compliance voltage (0.1–5.0 V)
 frost lakeshore625 get-limits         # Current/voltage/rate limits
 frost lakeshore625 set-limits <A> <V> <A/s>  # Set all limits
 frost lakeshore625 quench-status
-frost lakeshore625 enable-quench
-frost lakeshore625 disable-quench
-frost lakeshore625 set-quench <step_limit>
+frost lakeshore625 enable-quench      # Enable quench detection, preserving current step limit
+frost lakeshore625 disable-quench     # Disable quench detection, preserving current step limit
+frost lakeshore625 set-quench <enable> <step_limit>  # Set enable (0/1) and step limit together
 frost lakeshore625 error-status       # Hardware/operation/PSH error register
 frost lakeshore625 logging            # Start ramp data logging to CSV
 frost lakeshore625 raw "<SCPI cmd>"   # Send arbitrary SCPI command
@@ -392,13 +402,13 @@ Phase 5: Running at base temperature  (~36 hours)
 
 ### Phase details
 
-**Phase 0 — Precondition check:** Verifies the system is in the expected cold state before starting. Checks 4K stage < 4.5K, both heat switches OFF (< 10K), both heads < 5K, both pumps < 10K.
+**Phase 0 — Precondition check:** Verifies all LS350 outputs are at 0% before starting. Thermal preconditions (4K stage, heads, pumps, switches) are enforced by the start-safety interlock (compressor running + 4K stage < 4.2K) rather than Phase 0.
 
 **Phase 1 — Ramp up:** Executes a fixed time-based ramp schedule (30%→50%→80% for Output 1, 30%→50%→60% for Output 2 over 90 seconds), then holds at 80%/60% and polls every 30 s. Once the 4-pump reaches 45K, Output 1 is stepped down by 8% per poll until it reaches 25%. Once the 3-pump reaches 42K, Output 2 is stepped down by 8% per poll until it reaches 18%. The two pumps step down independently. Phase 1 exits when both outputs have reached their floors (25% / 18%).
 
 The 3-pump step-down starts at **42K**, which is 3K below the target band of 45–55K. This is intentional overshoot prevention: at 60% output the pump is rising at several K/min, so waiting until 45K to begin stepping down would result in the pump coasting well past 55K before the reduced output takes effect. Starting at 42K gives the step-down ~3K of runway to arrest the rise before the pump enters the target range. The same principle applies to the 4-pump, whose step-down begins at 45K — 15K below its 60K upper limit.
 
-**Phase 2 — Stabilize:** Holds 4-pump at 50–60K and 3-pump at 45–55K using a rate-limited feedback loop (adjustments at most once every 3 minutes per output). Uses rolling averages and dT/dt to avoid reacting to noise. Exits when the **4-head** plateaus below 5.45K, both pumps have been in range for 10+ continuous minutes, and the system has been settled for 5+ minutes. These exit conditions may be changed over time. Timeout exit available after 120 minutes if both heads are below 6.0K. 
+**Phase 2 — Stabilize:** Holds 4-pump at 50–60K and 3-pump at 45–55K using a rate-limited feedback loop (adjustments at most once every 3 minutes per output). Uses rolling averages and dT/dt to avoid reacting to noise. Exits when the **4-head** plateaus below 5.45K and both pumps have been in range for 10+ continuous minutes. Timeout exit available after 120 minutes if both heads are below 6.0K.
 
 **Phase 3 — Cycle ⁴He:** Turns off 4-pump (Output 1 → 0%), opens 4-switch (Output 3 → 40%). Two concurrent control loops run every 30 seconds for the rest of the run:
 
