@@ -329,7 +329,9 @@ impl LakeShore625Controller {
         log_file: Option<Arc<Mutex<File>>>,
     ) -> Result<(), String> {
         const OUTPUT_DIR:    &str = "ramps";
-        const INTERVAL_SECS: u64 = 60;
+        const CSV_INTERVAL_SECS:     u64 = 60;                                   // ramps/ CSV row cadence (unchanged)
+        const READOUT_INTERVAL_SECS: u64 = 5;                                    // GUI live-readout state-file cadence
+        const CSV_EVERY_N_READOUTS:  u64 = CSV_INTERVAL_SECS / READOUT_INTERVAL_SECS;
 
         // In standalone mode create a fresh MD file; in ADR mode use the shared one.
         let owned_file: Option<Arc<Mutex<File>>> = if log_file.is_none() {
@@ -338,7 +340,7 @@ impl LakeShore625Controller {
             let date_str = Local::now().format("%Y-%m-%d").to_string();
             let path = next_ramp_log(OUTPUT_DIR, &date_str);
             println!("Starting LakeShore 625 ramp data logging...");
-            println!("Recording interval: {} seconds", INTERVAL_SECS);
+            println!("Recording interval: {} seconds", CSV_INTERVAL_SECS);
             println!("Log file will be saved as: {}", path);
             println!("Press Ctrl+C to stop recording and save data");
             let mut f = OpenOptions::new()
@@ -354,37 +356,51 @@ impl LakeShore625Controller {
 
         let file = log_file.as_ref().or(owned_file.as_ref()).unwrap();
         let start = std::time::Instant::now();
+        let mut tick: u64 = 0;
 
         while !stop.load(Ordering::Relaxed) {
-            let ts        = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let elap_mins = start.elapsed().as_secs_f64() / 60.0;
-
-            let rate  = self.read_f64("RATE?");
+            // Read the live values every readout tick (fast cadence).
             let cur   = self.read_f64("RDGI?");
             let volt  = self.read_f64("RDGV?");
             let field = self.read_f64("RDGF?");
-            let err   = self.read_error_compact();
 
-            let line = format!(
-                "[{}] [LS625] t={:.1}m | current: {} A | field: {} T | voltage: {} V | rate: {} A/s | error: {}",
-                ts, elap_mins,
-                fmt_ramp_f64_opt(cur,   4),
-                fmt_ramp_f64_opt(field, 4),
-                fmt_ramp_f64_opt(volt,  4),
-                fmt_ramp_f64_opt(rate,  4),
-                err,
+            // Bridge for the GUI worker: it reads this file instead of polling
+            // the LS625 while a ramp owns the port (see worker poll loop).
+            crate::worker::write_adr_magnet_readout(
+                &fmt_ramp_f64_opt(cur,   4),
+                &fmt_ramp_f64_opt(volt,  4),
+                &fmt_ramp_f64_opt(field, 4),
             );
 
-            println!("{}", line);
+            // CSV row + stdout at the slower cadence (60 s, unchanged).
+            if tick % CSV_EVERY_N_READOUTS == 0 {
+                let ts        = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let elap_mins = start.elapsed().as_secs_f64() / 60.0;
+                let rate = self.read_f64("RATE?");
+                let err  = self.read_error_compact();
 
-            if let Ok(mut f) = file.lock() {
-                if let Err(e) = writeln!(f, "{}", line) {
-                    eprintln!("Warning: could not write log line: {e}");
+                let line = format!(
+                    "[{}] [LS625] t={:.1}m | current: {} A | field: {} T | voltage: {} V | rate: {} A/s | error: {}",
+                    ts, elap_mins,
+                    fmt_ramp_f64_opt(cur,   4),
+                    fmt_ramp_f64_opt(field, 4),
+                    fmt_ramp_f64_opt(volt,  4),
+                    fmt_ramp_f64_opt(rate,  4),
+                    err,
+                );
+
+                println!("{}", line);
+
+                if let Ok(mut f) = file.lock() {
+                    if let Err(e) = writeln!(f, "{}", line) {
+                        eprintln!("Warning: could not write log line: {e}");
+                    }
                 }
             }
+            tick = tick.wrapping_add(1);
 
-            // Sleep in 100 ms ticks so the stop flag is noticed promptly.
-            for _ in 0..(INTERVAL_SECS * 10) {
+            // Sleep the readout interval in 100 ms ticks so stop is noticed promptly.
+            for _ in 0..(READOUT_INTERVAL_SECS * 10) {
                 if stop.load(Ordering::Relaxed) { break; }
                 std::thread::sleep(Duration::from_millis(100));
             }
