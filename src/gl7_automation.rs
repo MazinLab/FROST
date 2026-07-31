@@ -580,45 +580,7 @@ pub fn phase0_check(csv_path: &str, log: &mut Gl7Logger) -> Result<(), String> {
     // ── Temperature checks (from CSV) ─────────────────────────────────────────
     let t = read_latest_temps(csv_path)?;
 
-    // TEMPORARILY DISABLED — remove comments to re-enable before production use
-    // if t.stage_4k_k >= 4.5 {
-    //     return Err(format!(
-    //         "4K stage too warm: {:.3} K  (must be < 4.5 K)",
-    //         t.stage_4k_k
-    //     ));
-    // }
-    // if t.switch_k >= 10.0 {
-    //     return Err(format!(
-    //         "Switch too warm: {:.3} K  (must be < 10 K — switch may be open)",
-    //         t.switch_k
-    //     ));
-    // }
-    // if t.head3_k >= 5.0 {
-    //     return Err(format!(
-    //         "3-head too warm: {:.3} K  (must be < 5 K)",
-    //         t.head3_k
-    //     ));
-    // }
-    // if t.head4_k >= 5.0 {
-    //     return Err(format!(
-    //         "4-head too warm: {:.3} K  (must be < 5 K)",
-    //         t.head4_k
-    //     ));
-    // }
-    // if t.pump3_k >= 10.0 {
-    //     return Err(format!(
-    //         "3-pump too warm: {:.3} K  (must be < 10 K)",
-    //         t.pump3_k
-    //     ));
-    // }
-    // if t.pump4_k >= 10.0 {
-    //     return Err(format!(
-    //         "4-pump too warm: {:.3} K  (must be < 10 K)",
-    //         t.pump4_k
-    //     ));
-    // }
-
-    log.log(&format!("[GL7]   Temperatures OK:"));
+    log.log(&format!("[GL7]   Temperatures:"));
     log.log(&format!("[GL7]     4K stage:  {:.3} K", t.stage_4k_k));
     log.log(&format!("[GL7]     switch:    {:.3} K", t.switch_k));
     log.log(&format!("[GL7]     3-head:    {:.3} K", t.head3_k));
