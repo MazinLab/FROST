@@ -26,7 +26,7 @@ FROST provides a single interface for controlling and monitoring all cryostat ha
 
 ## Installation
 
-After building, the binary lives at `target/release/frost`. The recommended installation is a symlink — it survives rebuilds without any extra steps:
+After building, the binary lives at `target/release/frost`. The recommended installation is a symlink because it survives rebuilds without any extra steps:
 
 ```bash
 sudo ln -sf $(pwd)/target/release/frost /usr/local/bin/frost
@@ -60,7 +60,7 @@ cargo test -- --include-ignored
 
 ## Serial Port Configuration
 
-All device ports have hardcoded defaults that match the lab setup. They can be overridden per-command with `--port` and `--baud` flags.
+All device ports have hardcoded defaults that match the MEC Prime set-up. They can be overridden per-command with `--port` and `--baud` flags.
 
 | Device | Default Port | Default Baud |
 |--------|-------------|--------------|
@@ -78,7 +78,7 @@ frost heatswitch --port /dev/ttyUSB1 --device-id 2 open
 frost compressor --port /dev/ttyUSB0 --addr 17 status
 ```
 
-There are no config files — if you need permanent port reassignment, update the `DEFAULT_PORT` constants in the relevant `src/<device>.rs` file.
+There are no config files. If you need permanent port reassignment, update the `DEFAULT_PORT` constants in the relevant `src/<device>.rs` file.
 
 ### Busy-port retry behavior
 
@@ -117,23 +117,24 @@ The GUI is divided into five sections displayed top-to-bottom. A fixed status ba
 - Five indicator chips: **Compressor**, **ADR Ramp**, **GL7**, **Recording**, **Heatswitch**
 - Chip is green (active) or dark/muted (inactive)
 - GL7 is considered active if any heater/switch output is non-zero or a cooldown subprocess is alive
+- Heatswitch is considered active when open
 
 **Thermometry**
 - Live temperature readings from all LS350 inputs (4K Stage, ADR, 4-Switch, 3-Head, 4-Head, 3-Pump, 4-Pump) and LS370 input 1 (Device Stage)
-- Inputs using custom calibration (3-head, 4-head, pump diodes) show calibrated temperatures in Kelvin
+- Inputs using custom calibration (3-head, 4-head, pump and switch diodes) show calibrated temperatures in Kelvin
 - **Record Temperatures** button starts continuous CSV logging to `temps/YYYY-MM-DD_temperature_log.csv` at 30-second intervals; button turns red and reads "Stop Recording Temperatures" while active
-- Recording state persists across restarts (`temps/.recording_active` lock file) — the GUI detects an interrupted recording on startup and resumes it automatically
+- Recording state persists across restarts (`temps/.recording_active` lock file). The GUI detects an interrupted recording on startup and resumes it automatically
 
 **Compressor**
 - Start/Stop buttons with live status display (running state, error flags)
-- Compressor intent is persisted to disk (`state/.compressor_intent`) — if FROST is restarted, the GUI restores the last known compressor state
+- Compressor intent is persisted to disk (`state/.compressor_intent`). If FROST is restarted, the GUI restores the last known compressor state
 
 **ADR Cooldown**
 - Live readouts: output current (A), voltage (V), magnetic field (T)
 - Input fields for ramp rate (A/s), target current (A), and soak time (minutes)
 - **Start ADR Cooldown** launches the full automated ramp sequence; button turns red and shows elapsed time while the ramp is running
 - Live log output displayed in the GUI during the ramp
-- Ramp state persisted to `state/.adr_ramp_running` — detects interrupted ramps on restart
+- Ramp state persisted to `state/.adr_ramp_running` to detect interrupted ramps on restart
 - **Crash recovery:** if the GUI starts and finds a stale ramp lock file (subprocess died), it reads the LS625 current and automatically ramps to 0 A if the magnet is still energized above 0.5 A
 
 **GL7 Sorption Cooler**
@@ -159,7 +160,7 @@ Run `frost --help` for the full list of devices and commands, or `frost <device>
 | `frost adr` | `ramp <rate> <current> [--soak-mins N]`, `logging` | Full automated ADR ramp sequence |
 | `frost compressor` | `status`, `start`, `stop`, `all` | Cryomech compressor control |
 | `frost lakeshore625` | `current`, `set-current <A>`, `set-rate <A/s>`, `quench-status`, `raw` | Magnet power supply |
-| `frost lakeshore370` | `kelvin <input>`, `resistance <input>`, `set-heater <pct>`, `raw` | Device stage thermometry (inputs 1–16) |
+| `frost lakeshore370` | `kelvin <input>`, `resistance <input>`, `set-heater <pct>`, `raw` | Device stage thermometry |
 | `frost lakeshore350` | `all`, `read <input>`, `set-output <N> <pct>`, `query-all-outputs`, `raw` | Stage thermometry + GL7 outputs |
 | `frost heatswitch` | `open`, `close`, `home`, `stop`, `estop` | Zaber stepper motor |
 | `frost record-temps` | `snapshot`, `loop [--interval N]` | Temperature CSV logging |
@@ -184,9 +185,8 @@ The ramp command runs the full automated sequence: start background logger → s
 | Input | Sensor | Calibration |
 |-------|--------|-------------|
 | A | 3-head thermometer | CSV (Ω → K) |
-| B | RuOx | LS350 internal curve (K direct) |
 | C | 4-head thermometer | CSV (Ω + 34.56Ω offset → K) |
-| D2 | Switch diode | CSV (V → K) |
+| D2 | 4-switch diode | CSV (V → K) |
 | D3 | 4K stage diode | LS350 curve 21 (K direct) |
 | D4 | 3-pump diode | CSV (V → K) |
 | D5 | 4-pump diode | CSV (V → K) |
@@ -199,13 +199,13 @@ frost record-temps loop --interval 60
 frost record-temps snapshot          # Single reading to stdout
 ```
 
-Logs are written to `temps/YYYY-MM-DD_temperature_log.csv` (17 fixed-width space-padded columns covering all LS350 inputs and LS370 input 1). Ctrl+C ends the recording. It is recommended to run this in a tmux pane.
+Logs are written to `temps/YYYY-MM-DD_temperature_log.csv` (17 fixed-width space-padded columns covering all LS350 inputs and LS370 input 1 device stage). Ctrl+C ends the recording. It is recommended to run this in a tmux pane if using CLI instead of the GUI.
 
 ---
 
 ## GL7 Sorption Cooler Cooldown
 
-The `frost gl7` commands automate the cooldown of a Chase Research Cryogenics GL7 two-stage ³He sorption cooler from ~3.8K to ~320mK base temperature. The controller reads temperature data from the CSV written by `frost record-temps loop` and writes output percentages to the Lakeshore 350. **Temperature recording must be running before and during the cooldown.**
+The `frost gl7` commands automate the cooldown of the Chase Research Cryogenics GL7 two-stage helium-3/helium-4 sorption cooler from 4K stage temperature (~3.6K) to ~310mK base temperature. The controller reads temperature data from the CSV written by `frost record-temps loop` and writes output percentages to the Lakeshore 350. **Temperature recording must be running before and during the cooldown.**
 
 ### Output map
 
@@ -289,7 +289,7 @@ These override all phase logic at every iteration:
 
 ## Safety Interlocks
 
-FROST enforces start-safety interlocks before any potentially-dangerous operation is **started**. Two preconditions must both hold:
+FROST enforces start-safety interlocks before any potentially dangerous operation is **started**. Two preconditions must both hold:
 
 1. The **compressor is running**.
 2. The **4K stage** (LS350 input D3) is **below 4.2 K** (a reading ≥ 4.2 K blocks).
@@ -327,7 +327,7 @@ Both log types auto-increment filenames (`_2.csv`, `_3.csv`, …) when a file fo
 **Temperature CSV columns** (17 total, fixed-width space-padded):
 `Timestamp, Date, Time, 4K_Stage_Temp, Switch_Volt, Switch_Temp, 3Head_Res, 3Head_Temp, 4Head_Res_Raw, 4Head_Res_Adj, 4Head_Temp, 3Pump_Volt, 3Pump_Temp, 4Pump_Volt, 4Pump_Temp, Device_Stage_Res, Device_Stage_Temp`
 
-`Switch_Temp` (`Switch_Temp_K`) is the **4-switch temperature** (LS350 D2) — the primary feedback signal for Output 3 regulation in GL7 phases 3–5.
+`Switch_Temp` (`Switch_Temp_K`) is the **4-switch temperature** (LS350 D2)
 
 ---
 
