@@ -467,6 +467,23 @@ fn read_latest_temps_empty_file_errors() {
     assert!(result.is_err(), "empty CSV (no data rows) should return Err");
 }
 
+#[test]
+fn read_latest_temps_tail_read_large_file() {
+    // Generate enough rows to exceed the 512-byte tail threshold so the
+    // seek-to-tail fast path is exercised. Each row is ~90 bytes, so 20
+    // rows (~1800 bytes) guarantees the file is well over 512 bytes.
+    let rows: Vec<String> = (0..20)
+        .map(|i| make_row(3.9, 4.0, 3.8, 3.7, 50.0 + i as f64, 51.0))
+        .collect();
+    let row_refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
+    let f = write_temp_csv(&row_refs);
+
+    let t = read_latest_temps(f.path().to_str().unwrap()).unwrap();
+    // Last row has pump3 = 50.0 + 19 = 69.0
+    assert!((t.pump3_k - 69.0).abs() < 1e-6, "should read last row via tail seek");
+    assert!((t.stage_4k_k - 3.9).abs() < 1e-6);
+}
+
 // ── Dry-run safety ─────────────────────────────────────────────────────────────
 
 // ── retry_on_busy ─────────────────────────────────────────────────────────────

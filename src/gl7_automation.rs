@@ -176,8 +176,32 @@ pub struct TempSnapshot {
 }
 
 /// Read the most recent data row from the temperature CSV and return a
-/// `TempSnapshot`. Skips the header and dashes separator rows.
+/// `TempSnapshot`. Seeks to the tail of the file first to avoid reading
+/// the entire CSV (which grows to thousands of rows during long runs).
+/// Falls back to a full read if the tail doesn't contain a valid row.
 pub fn read_latest_temps(csv_path: &str) -> Result<TempSnapshot, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 512;
+
+    let mut file = fs::File::open(csv_path)
+        .map_err(|e| format!("Cannot read CSV '{}': {}", csv_path, e))?;
+
+    let file_len = file.metadata()
+        .map_err(|e| format!("Cannot stat CSV '{}': {}", csv_path, e))?
+        .len();
+
+    if file_len > TAIL_BYTES {
+        let _ = file.seek(SeekFrom::End(-(TAIL_BYTES as i64)));
+        let mut tail = String::new();
+        file.read_to_string(&mut tail)
+            .map_err(|e| format!("Cannot read tail of '{}': {}", csv_path, e))?;
+
+        if let Some(snap) = tail.lines().filter_map(parse_csv_row).last() {
+            return Ok(snap);
+        }
+    }
+
     let contents = fs::read_to_string(csv_path)
         .map_err(|e| format!("Cannot read CSV '{}': {}", csv_path, e))?;
 
