@@ -310,7 +310,7 @@ frost record-temps loop
 frost record-temps loop --interval 60
 ```
 
-Logs are written to `temps/YYYY-MM-DD_temperature_log.csv`. If a file already exists for the current date, subsequent runs write to `_2.csv`, `_3.csv`, etc. The CSV format is 19 fixed-width space-padded columns covering all LS350 inputs and LS370 input 1.
+Logs are written to `temps/YYYY-MM-DD_temperature_log.csv`. If a file already exists for the current date, subsequent runs write to `_2.csv`, `_3.csv`, etc. The CSV format is 17 fixed-width space-padded columns covering LS350 inputs and LS370 input 1 (device stage).
 
 ### `frost safety` — Start-Safety Interlocks
 
@@ -519,8 +519,8 @@ temps/YYYY-MM-DD_temperature_log.csv
 temps/YYYY-MM-DD_temperature_log_2.csv
 ```
 
-Columns (19 total, fixed-width space-padded):
-`Timestamp, Date, Time, 4K_Stage_Temp, ADR_Res, ADR_Temp, Switch_Volt, Switch_Temp, 3Head_Res, 3Head_Temp, 4Head_Res_Raw, 4Head_Res_Adj, 4Head_Temp, 3Pump_Volt, 3Pump_Temp, 4Pump_Volt, 4Pump_Temp, LS370_In1_Res, LS370_In1_Temp`
+Columns (17 total, fixed-width space-padded):
+`Timestamp, Date, Time, 4K_Stage_Temp, Switch_Volt, Switch_Temp, 3Head_Res, 3Head_Temp, 4Head_Res_Raw, 4Head_Res_Adj, 4Head_Temp, 3Pump_Volt, 3Pump_Temp, 4Pump_Volt, 4Pump_Temp, Device_Stage_Res, Device_Stage_Temp`
 
 `Switch_Temp` (`Switch_Temp_K`) is the **4-switch temperature** (LS350 D2). It is the primary feedback signal for Output 3 regulation in phases 3–5 of the GL7 cooldown.
 

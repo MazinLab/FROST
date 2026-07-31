@@ -161,11 +161,11 @@ const EPSILON_PCT: f64                  = 0.001;
 ///
 /// Column mapping (0-based indices into the whitespace-split row):
 ///   3  → 4K_Stage_Temp_K   (LS350 D3)
-///   7  → Switch_Temp_K     (LS350 D2 — 4-switch temperature)
-///   9  → 3_Head_Temp_K     (LS350 A)
-///  12  → 4_Head_Temp_K     (LS350 C)
-///  14  → 3_Pump_Temp_K     (LS350 D4)
-///  16  → 4_Pump_Temp_K     (LS350 D5)
+///   5  → Switch_Temp_K     (LS350 D2 — 4-switch temperature)
+///   7  → 3_Head_Temp_K     (LS350 A)
+///  10  → 4_Head_Temp_K     (LS350 C)
+///  12  → 3_Pump_Temp_K     (LS350 D4)
+///  14  → 4_Pump_Temp_K     (LS350 D5)
 pub struct TempSnapshot {
     pub stage_4k_k: f64,
     pub switch_k:   f64,  // 4-switch temperature (LS350 D2, Switch_Temp_K column)
