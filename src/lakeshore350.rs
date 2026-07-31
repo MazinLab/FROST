@@ -68,10 +68,14 @@ impl ThreeHeadCalibration {
         if resistances.is_empty() {
             return Err("No valid calibration data found in CSV".to_string());
         }
-        
-        Ok(Self { resistances, temperatures })
+
+        let mut pairs: Vec<(f64, f64)> = resistances.iter().zip(temperatures.iter()).map(|(&r, &t)| (r, t)).collect();
+        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let (sorted_resistances, sorted_temperatures): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
+
+        Ok(Self { resistances: sorted_resistances, temperatures: sorted_temperatures })
     }
-    
+
     /// Convert resistance (Ω) to temperature (K) using linear interpolation.
     /// Mirrors resistance_to_temperature() method in Python.
     pub fn resistance_to_temperature(&self, resistance: f64) -> Option<f64> {
