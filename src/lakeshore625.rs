@@ -267,15 +267,22 @@ impl LakeShore625Controller {
         }
     }
 
-    /// `QNCH 1` / `QNCH 0` — enable or disable quench detection.
-    pub fn set_quench_enable(&mut self, enable: bool) -> Result<(), String> {
-        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("QNCH {}", if enable { 1 } else { 0 }), "\r\n", 200)?;
-        Ok(())
+    /// Query the current quench step limit from `QNCH?`, returning the value
+    /// or an error if the instrument doesn't respond or the response is malformed.
+    pub fn get_quench_step_limit(&self) -> Result<f64, String> {
+        let r = crate::serial::scpi_query(&self.port, self.baud_rate, "QNCH?", "\r\n", 200)?;
+        let parts: Vec<&str> = r.splitn(2, ',').collect();
+        if parts.len() == 2 {
+            parts[1].trim().parse::<f64>()
+                .map_err(|_| format!("Cannot parse step limit from QNCH? response: {r}"))
+        } else {
+            Err(format!("Unexpected QNCH? response: {r}"))
+        }
     }
 
-    /// `QNCH <enable> <step_limit>` — set quench detection enable and step limit together.
+    /// `QNCH <enable>,<step_limit>` — set quench detection enable and step limit.
     pub fn set_quench_detection(&mut self, enable: bool, step_limit: f64) -> Result<(), String> {
-        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("QNCH {} {step_limit}", if enable { 1 } else { 0 }), "\r\n", 200)?;
+        crate::serial::scpi_write(&self.port, self.baud_rate, &format!("QNCH {},{:.4}", if enable { 1 } else { 0 }, step_limit), "\r\n", 200)?;
         Ok(())
     }
 

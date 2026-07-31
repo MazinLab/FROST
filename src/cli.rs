@@ -899,13 +899,15 @@ fn run_lakeshore625(ctrl: &mut LakeShore625Controller, cmd: Lakeshore625Cmd) -> 
             print_ctrl(&ctrl.output, &ctrl.error_message)
         }
         Lakeshore625Cmd::EnableQuench => {
-            ctrl.set_quench_enable(true)?;
-            println!("Quench detection enabled.");
+            let step_limit = ctrl.get_quench_step_limit()?;
+            ctrl.set_quench_detection(true, step_limit)?;
+            println!("Quench detection enabled (step limit: {:.4} A/s).", step_limit);
             Ok(())
         }
         Lakeshore625Cmd::DisableQuench => {
-            ctrl.set_quench_enable(false)?;
-            println!("Quench detection disabled.");
+            let step_limit = ctrl.get_quench_step_limit()?;
+            ctrl.set_quench_detection(false, step_limit)?;
+            println!("Quench detection disabled (step limit: {:.4} A/s).", step_limit);
             Ok(())
         }
         Lakeshore625Cmd::SetQuench { enable, step_limit } => {
