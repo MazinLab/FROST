@@ -38,6 +38,49 @@ pub const SOAK_TOLERANCE: f64 = 0.04;
 /// Current must drop to this level (amps) or below before the sequence completes.
 pub const ZERO_TOLERANCE: f64 = 0.004;
 
+// ── Transient serial-lock retry ───────────────────────────────────────────────
+
+/// True if `msg` looks like a transient exclusive-lock/port-busy error (as
+/// opposed to a genuine instrument fault). Only these are worth retrying.
+pub fn is_transient_lock_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("busy") || m.contains("lock") || m.contains("exclusive")
+}
+
+/// Run `op`, retrying up to `max_tries` (waiting `delay` between attempts) but
+/// ONLY while the error looks like a transient port-lock/busy condition. A
+/// genuine fault returns immediately; the last error is returned if all tries
+/// are exhausted. This protects the critical `set_*` commands (especially the
+/// demag `set_current(0)`) from being aborted by a momentary lock clash with
+/// the ramp's own logger thread or a stray opener.
+pub fn retry_on_busy_cfg<F>(mut op: F, max_tries: u32, delay: Duration) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if is_transient_lock_error(&e) && attempt < max_tries {
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Default retry policy for LS625 set-commands: 5 tries, 400 ms apart.
+pub fn retry_on_busy<F>(op: F) -> Result<(), String>
+where
+    F: FnMut() -> Result<(), String>,
+{
+    retry_on_busy_cfg(op, 5, Duration::from_millis(400))
+}
+
 // ── Log message type (used by GUI to display live ramp progress) ─────────────
 
 /// A progress message emitted by `run_adr_ramp`.
@@ -121,7 +164,7 @@ pub fn run_adr_ramp(
     // ── Step 1: Set ramp rate ─────────────────────────────────────────────────
     ll(format!("[ADR] Step 1/7 — Setting ramp rate to {} A/s ...", rate));
     let mut ls625 = LakeShore625Controller::default();
-    if let Err(e) = ls625.set_ramp_rate(rate) {
+    if let Err(e) = retry_on_busy(|| ls625.set_ramp_rate(rate)) {
         stop_flag.store(true, Ordering::Relaxed);
         let _ = log_thread.join();
         return Err(e);
@@ -130,7 +173,7 @@ pub fn run_adr_ramp(
 
     // ── Step 2: Set target current (instrument starts ramping immediately) ────
     ll(format!("[ADR] Step 2/7 — Setting target current to {} A ...", current));
-    if let Err(e) = ls625.set_current(current) {
+    if let Err(e) = retry_on_busy(|| ls625.set_current(current)) {
         stop_flag.store(true, Ordering::Relaxed);
         let _ = log_thread.join();
         return Err(e);
@@ -223,7 +266,7 @@ pub fn run_adr_ramp(
 
     // ── Step 6: Ramp current to 0 ────────────────────────────────────────────
     ll("[ADR] Step 6/7 — Setting target current to 0 A (instrument ramping down) ...".to_string());
-    if let Err(e) = ls625.set_current(0.0) {
+    if let Err(e) = retry_on_busy(|| ls625.set_current(0.0)) {
         stop_flag.store(true, Ordering::Relaxed);
         let _ = log_thread.join();
         return Err(e);
