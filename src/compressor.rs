@@ -23,6 +23,12 @@ pub struct CryomechController {
     pub error_message: Option<String>,
     /// Output from get_status(), shown in the status panel.
     pub status_output: String,
+    /// Canonical running state parsed directly from the `comp_on()` result during
+    /// `get_status()` — the single source of truth for "is the compressor on?".
+    /// `None` until the first successful status query (or after a comms error).
+    /// Callers must read this instead of scraping `status_output` text, so the
+    /// GUI button and the safety interlock can never disagree about the fact.
+    pub running: Option<bool>,
     /// Output from get_all_readings() / get_temperature() / get_pressure() /
     /// get_system_info(), shown in the "All Readings" panel.
     pub all_output: String,
@@ -36,6 +42,7 @@ impl Default for CryomechController {
             device_addr: DEFAULT_ADDR,
             error_message: None,
             status_output: String::new(),
+            running: None,
             all_output: String::new(),
         }
     }
@@ -60,8 +67,14 @@ impl CryomechController {
             Ok(mut api) => {
                 let mut out = String::new();
                 match api.comp_on() {
-                    Ok(r)  => out.push_str(&format!("Running:         {}\n", if r { "Yes" } else { "No" })),
-                    Err(e) => out.push_str(&format!("Running:         ERROR ({})\n", e)),
+                    Ok(r)  => {
+                        out.push_str(&format!("Running:         {}\n", if r { "Yes" } else { "No" }));
+                        self.running = Some(r);
+                    }
+                    Err(e) => {
+                        out.push_str(&format!("Running:         ERROR ({})\n", e));
+                        self.running = None;
+                    }
                 }
                 match api.comp_minutes() {
                     Ok(m)  => out.push_str(&format!("Runtime:         {:.1} hrs  ({} min)\n", m as f32 / 60.0, m)),
@@ -76,6 +89,15 @@ impl CryomechController {
             }
             Err(e) => self.error_message = Some(format!("Connection failed: {e}")),
         }
+    }
+
+    /// Return whether the compressor is currently running, in a single SMDP
+    /// round-trip. Cheaper and sturdier than `get_status()` for callers (e.g.
+    /// the safety interlock) that only need the running bit — no multi-query
+    /// latency and no parsing of a formatted status string.
+    pub fn is_running(&self) -> Result<bool, String> {
+        let mut api = self.connect()?;
+        api.comp_on().map_err(|e| e.to_string())
     }
 
     // ── Start / Stop ─────────────────────────────────────────
