@@ -152,7 +152,7 @@ frost <device> [OPTIONS] <command> [ARGS]
 
 Run `frost --help` for the full list of devices and commands, or `frost <device> --help` for device-specific options.
 
-### Device commands at a glance
+### Common Device Commands
 
 | Device | Common commands | Notes |
 |--------|----------------|-------|
@@ -322,6 +322,7 @@ Both log types auto-increment filenames (`_2.csv`, `_3.csv`, …) when a file fo
 |-----|----------|-----------|----------|
 | Ramp | `ramps/YYYY-MM-DD_ramp_log.csv` | `frost adr ramp` / `frost adr logging` | 1 row/min |
 | Temperature | `temps/YYYY-MM-DD_temperature_log.csv` | `frost record-temps loop` / GUI recording | 30 s (configurable) |
+| Safety | `logs/safety_log.txt` | Safety interlocks | On blocked starts only |
 
 **Temperature CSV columns** (17 total, fixed-width space-padded):
 `Timestamp, Date, Time, 4K_Stage_Temp, Switch_Volt, Switch_Temp, 3Head_Res, 3Head_Temp, 4Head_Res_Raw, 4Head_Res_Adj, 4Head_Temp, 3Pump_Volt, 3Pump_Temp, 4Pump_Volt, 4Pump_Temp, Device_Stage_Res, Device_Stage_Temp`
