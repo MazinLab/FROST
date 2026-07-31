@@ -78,9 +78,10 @@ pub fn scpi_write(
     Ok(())
 }
 
+const SCPI_BUSY_MAX_RETRIES: u32 = 10;
+
 fn open_scpi_port(port: &str, baud: u32) -> Result<Box<dyn SerialPort>, String> {
-    // Retry indefinitely on busy: concurrent processes can briefly hold the port.
-    // All other errors fail immediately.
+    let mut retries = 0;
     loop {
         match serialport::new(port, baud)
             .data_bits(DataBits::Seven)
@@ -91,7 +92,11 @@ fn open_scpi_port(port: &str, baud: u32) -> Result<Box<dyn SerialPort>, String> 
         {
             Ok(handle) => return Ok(handle),
             Err(e) if e.to_string().contains("Device or resource busy") => {
-                eprintln!("Port {port} busy, retrying in 15 s…");
+                retries += 1;
+                if retries >= SCPI_BUSY_MAX_RETRIES {
+                    return Err(format!("Failed to open {port}: still busy after {retries} retries"));
+                }
+                eprintln!("Port {port} busy, retrying in 15 s… (attempt {retries}/{SCPI_BUSY_MAX_RETRIES})");
                 std::thread::sleep(Duration::from_secs(15));
             }
             Err(e) => return Err(format!("Failed to open {port}: {e}")),
@@ -159,9 +164,10 @@ pub struct ZaberDriver {
 }
 
 impl ZaberDriver {
+    const ZABER_BUSY_MAX_RETRIES: u32 = 2;
+
     pub fn new(port_name: &str, baudrate: u32, device_id: u8) -> ZResult<Self> {
-        // Retry indefinitely on busy: concurrent processes (e.g. two ramp instances)
-        // can briefly hold the port. All other errors fail immediately.
+        let mut retries = 0;
         let port = loop {
             match serialport::new(port_name, baudrate)
                 .timeout(Duration::from_millis(1000))
@@ -169,7 +175,11 @@ impl ZaberDriver {
             {
                 Ok(handle) => break handle,
                 Err(e) if e.to_string().contains("Device or resource busy") => {
-                    eprintln!("Port {port_name} busy, retrying in 15 s…");
+                    retries += 1;
+                    if retries >= Self::ZABER_BUSY_MAX_RETRIES {
+                        return Err(ZaberError::Serial(e));
+                    }
+                    eprintln!("Port {port_name} busy, retrying in 15 s… (attempt {retries}/{})", Self::ZABER_BUSY_MAX_RETRIES);
                     std::thread::sleep(Duration::from_secs(15));
                 }
                 Err(e) => return Err(ZaberError::Serial(e)),
