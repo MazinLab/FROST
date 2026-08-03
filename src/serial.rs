@@ -116,7 +116,6 @@ pub const CMD_GET_POS: u8 = 60;
 pub const CMD_GET_SETTING: u8 = 53;
 
 // Setting codes — fixed by Zaber binary protocol spec
-pub const SETTING_TARGET_SPEED: u32 = 41;
 pub const SETTING_MAXSPEED: u32 = 42;
 pub const SETTING_LIMIT_HOME_TRIGGERED: u32 = 103;
 pub const SETTING_LIMIT_CW_TRIGGERED: u32 = 104;
@@ -247,10 +246,6 @@ impl ZaberDriver {
     pub fn get_home_status(&mut self) -> ZResult<bool> {
         let r = self.send_command(CMD_GET_SETTING, SETTING_LIMIT_HOME_TRIGGERED)?;
         Ok(r.data != 0)
-    }
-    pub fn get_target_speed(&mut self) -> ZResult<u32> {
-        let r = self.send_command(CMD_GET_SETTING, SETTING_TARGET_SPEED)?;
-        Ok(r.data)
     }
     pub fn get_maxspeed(&mut self) -> ZResult<u32> {
         let r = self.send_command(CMD_GET_SETTING, SETTING_MAXSPEED)?;
