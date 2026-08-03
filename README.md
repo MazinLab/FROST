@@ -265,7 +265,7 @@ Exits when both heads fall below 2.0K.
 
 **Phase 4 — Cycle ³He:** Turns off 3-pump (Output 2 → 0%), opens 3-switch (Output 4 → 40%). Output 3 (4-switch) continues to be regulated in the 20–22K range as in Phase 3. No other adjustments are made. Exits when 3-head sustains below 350mK for 5 minutes.
 
-**Phase 5 — Running:** Output 3 (4-switch) continues to be regulated in the 20–22K range. All other outputs are held at their Phase 4 exit values. Monitors every 5 minutes. Exits and alerts when ⁴He is exhausted (4-head > 3K and rising at > 0.01 K/min). Typical hold time: ~36 hours.
+**Phase 5 — Running:** Output 3 (4-switch) continues to be regulated in the 20–22K range. All other outputs are held at their Phase 4 exit values. Monitors every 5 minutes. When ⁴He is exhausted (4-head > 3K and rising at > 0.01 K/min), Outputs 3 and 4 are zeroed (closing both heat switches) and the run is complete. Typical hold time: ~36 hours.
 
 ### Safety limits
 
