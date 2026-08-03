@@ -23,7 +23,7 @@ use frost::serial::{
     scpi_query, scpi_write, ZaberDriver, ZaberError,
     ZaberCommand, ZaberResponse,
     CMD_HOME, CMD_MOVE_ABS, CMD_MOVE_REL, CMD_MOVE_VEL, CMD_STOP, CMD_GET_POS, CMD_GET_SETTING,
-    SETTING_TARGET_SPEED, SETTING_LIMIT_HOME_TRIGGERED, SETTING_MAXSPEED,
+    SETTING_LIMIT_HOME_TRIGGERED, SETTING_MAXSPEED,
     SETTING_LIMIT_CW_TRIGGERED, SETTING_LIMIT_CCW_TRIGGERED, SETTING_DEVICE_STATUS,
 };
 
@@ -229,7 +229,6 @@ fn zaber_command_codes_are_correct() {
 
 #[test]
 fn zaber_setting_codes_are_correct() {
-    assert_eq!(SETTING_TARGET_SPEED,          41);
     assert_eq!(SETTING_MAXSPEED,              42);
     assert_eq!(SETTING_LIMIT_HOME_TRIGGERED, 103);
     assert_eq!(SETTING_LIMIT_CW_TRIGGERED,   104);
